@@ -89,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
                 http,
                 session,
                 bypasser: Arc::new(utils::browser::CloudflareBypasser),
-                site: Some(site.clone()),
             };
 
             let engine = ScrapeEngine::new(site, ctx, config.clone());

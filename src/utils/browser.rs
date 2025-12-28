@@ -1,10 +1,3 @@
-//! 简化的一次性浏览器工具
-//!
-//! 优化点：
-//! 1. 扁平化逻辑，拒绝深层嵌套。
-//! 2. 编译时嵌入 stealth.js。
-//! 3. 全局缓存真实 UA，仅探测一次。
-
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -129,7 +122,7 @@ impl BrowserSession {
     }
 
     async fn probe_native_ua() -> String {
-        debug!("正在探测原生浏览器 User-Agent...");
+        debug!("正在探测 User-Agent...");
 
         let config = match BrowserConfig::builder()
             .arg("--headless=new")
@@ -168,7 +161,7 @@ impl BrowserSession {
                 let clean_ua = ua
                     .replace("HeadlessChrome", "Chrome")
                     .replace("Headless", "");
-                debug!("浏览器 UA 探测成功: {}", clean_ua);
+                debug!("UA 探测成功: {}", clean_ua);
                 clean_ua
             }
             Err(_) => Self::fallback_ua(),
@@ -193,16 +186,16 @@ impl Bypasser for CloudflareBypasser {
         let max_attempts = ctx.config.spider.retry_count;
 
         for attempt in 1..=max_attempts {
-            info!("正在通过浏览器绕过验证...");
+            info!("正在绕过验证...");
             debug!("尝试次数: {}/{}, URL: {}", attempt, max_attempts, url);
 
             match self.try_single_attempt(url, ctx).await {
                 Ok(_) => {
-                    info!("浏览器验证通过");
+                    info!("验证通过");
                     return Ok(());
                 }
                 Err(e) => {
-                    warn!("浏览器尝试失败，正在重试 ({}/{})", attempt, max_attempts);
+                    warn!("尝试失败，正在重试 ({}/{})", attempt, max_attempts);
                     debug!("错误详情: {}", e);
                     last_error = Some(e);
 
@@ -286,7 +279,7 @@ impl CloudflareBypasser {
             .map_err(|e| SpiderError::Browser(e.to_string()))?;
 
         if cookies.is_empty() {
-            warn!("未提取到任何浏览器 Cookie");
+            warn!("未提取到任何 Cookie");
         } else {
             let cookie_str = cookies
                 .iter()

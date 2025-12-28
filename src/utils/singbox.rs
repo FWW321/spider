@@ -21,11 +21,9 @@ pub struct SingBoxController {
 
 impl SingBoxController {
     pub fn new(bin_dir: &Path, cache_dir: &Path, api_port: u16, api_secret: &str) -> Result<Self> {
-        // 自动处理不同系统的扩展名 (Windows 为 .exe，Linux/Mac 为空)
         let executable = bin_dir.join(format!("sing-box{}", EXE_SUFFIX));
         let config_path = cache_dir.join("config.json");
 
-        // 预处理 API URL，避免后续每次请求都解析
         let api_base = Url::parse(&format!("http://127.0.0.1:{}", api_port))
             .context("Invalid API URL construction")?;
 
@@ -132,7 +130,6 @@ impl SingBoxController {
     }
 
     pub async fn switch_selector(&self, selector: &str, tag: &str) -> Result<()> {
-        // 使用 join 安全拼接 URL
         let url = self.api_base.join(&format!("proxies/{}", selector))?;
         let body = serde_json::json!({ "name": tag });
 

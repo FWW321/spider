@@ -6,7 +6,6 @@ use reqwest::{Request, Response, StatusCode, Url, header};
 use reqwest_middleware::{Error, Middleware, Next, Result};
 use tracing::{debug, info, warn};
 
-// 假设这些是在 crate 中定义的，保持原样引用
 use crate::actors::proxy::ProxyMsg;
 use crate::core::error::SpiderError;
 use crate::network::session::Session;
@@ -125,7 +124,6 @@ impl Middleware for AntiBlockMiddleware {
 
         debug!("响应状态: {} ({})", status.as_u16(), current_url);
 
-        // 仅在明确是重定向状态码时尝试跟随 Location
         if status.is_redirection() {
             if let Some(target_url) = Self::resolve_redirect_url(&current_url, &res) {
                 let redirect_count = ext.get::<RedirectCount>().map(|r| r.0).unwrap_or(0);
@@ -197,7 +195,7 @@ impl Middleware for AntiBlockMiddleware {
                 .map_err(|e| reqwest_middleware::Error::from(anyhow::anyhow!(e)))?;
 
             if recovered {
-                info!("访问阻断已自动解除，继续执行任务...");
+                info!("访问阻断已解除，继续执行任务...");
                 debug!("重试目标: {}", original_url_str);
 
                 ext.insert(RedirectCount(0));

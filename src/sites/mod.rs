@@ -17,11 +17,6 @@ pub mod booktoki;
 /// 任务参数
 pub type TaskArgs = HashMap<String, String>;
 
-// ============================================================================
-// 核心 Trait 定义
-// ============================================================================
-
-/// 浏览器绕过器接口
 #[async_trait]
 pub trait Bypasser: Send + Sync {
     async fn bypass(&self, url: &str, ctx: &SiteContext) -> Result<()>;
@@ -35,7 +30,6 @@ pub struct SiteContext {
     pub http: Arc<HttpService>,
     pub session: Arc<Session>,
     pub bypasser: Arc<dyn Bypasser>,
-    pub site: Option<Arc<dyn Site>>,
 }
 
 impl SiteContext {
@@ -57,16 +51,6 @@ impl SiteContext {
             let _ = rx.await;
             debug!("代理节点已完成物理切换");
         }
-    }
-
-    /// 构建中间件上下文（如果 site 可用）
-    pub fn mw_context(&self) -> Option<Arc<MiddlewareContext>> {
-        self.site.as_ref().map(|site| {
-            Arc::new(MiddlewareContext {
-                site: site.clone(),
-                ctx: self.clone(),
-            })
-        })
     }
 }
 
@@ -101,7 +85,6 @@ pub trait Site: UrlBuilder + Parser + Guardian + Send + Sync {
 // 供中间件使用的上下文
 // ============================================================================
 
-/// 中间件上下文 - 将站点和执行上下文绑定在一起
 pub struct MiddlewareContext {
     pub site: Arc<dyn Site>,
     pub ctx: SiteContext,
@@ -113,7 +96,6 @@ pub struct MiddlewareContext {
 
 type SiteFactory = Box<dyn Fn(SiteConfig) -> Box<dyn Site> + Send + Sync>;
 
-/// 站点注册表
 pub struct SiteRegistry {
     factories: HashMap<String, SiteFactory>,
 }

@@ -78,18 +78,16 @@ impl Task {
         path: PathBuf,
         ctx: &ScrapeContext,
     ) -> Result<Vec<Task>> {
-        if file_exists(&path).await {
-            match tokio::fs::read_to_string(&path).await {
-                Ok(html) if !html.is_empty() => {
-                    debug!("跳过已存在章节: {}", chapter.title);
-                    return Ok(Self::parse_images_from_html(
-                        &html,
-                        &chapter.url,
-                        &ctx.images_dir,
-                    ));
-                }
-                Ok(_) => debug!("本地章节文件内容为空: {}, 将重新下载", chapter.title),
-                Err(e) => debug!("读取本地章节失败: {}, 将重新下载", e),
+        if let Ok(html) = tokio::fs::read_to_string(&path).await {
+            if !html.is_empty() {
+                debug!("跳过已存在章节: {}", chapter.title);
+                return Ok(Self::parse_images_from_html(
+                    &html,
+                    &chapter.url,
+                    &ctx.images_dir,
+                ));
+            } else {
+                debug!("本地章节文件存在但为空: {}, 将重新下载", chapter.title);
             }
         }
 
@@ -181,19 +179,30 @@ impl ScrapeEngine {
         self.seed_chapter_tasks(&mut join_set, chapters, &text_dir, &ctx);
 
         while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(new_tasks)) => {
-                    for task in new_tasks {
-                        if let Task::Image { ref url, .. } = task {
-                            if !seen_images.insert(url.clone()) {
-                                continue;
-                            }
-                        }
-                        join_set.spawn(task.run(ctx.clone()));
+            let result = match res {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("并发调度错误: {}", e);
+                    continue;
+                }
+            };
+
+            let new_tasks = match result {
+                Ok(tasks) => tasks,
+                Err(e) => {
+                    error!("任务执行失败: {}", e);
+                    continue;
+                }
+            };
+
+            for task in new_tasks {
+                if let Task::Image { ref url, .. } = task {
+                    if !seen_images.insert(url.clone()) {
+                        continue;
                     }
                 }
-                Ok(Err(e)) => error!("任务执行失败: {}", e),
-                Err(e) => error!("并发调度错误: {}", e),
+
+                join_set.spawn(task.run(ctx.clone()));
             }
         }
 
@@ -387,7 +396,7 @@ impl ScrapeEngine {
         (new_html, images)
     }
 
-    /// 智能解析 ID
+    /// 解析 ID
     pub fn get_id(&self, args: &TaskArgs) -> String {
         args.get("id")
             .or_else(|| args.iter().find(|(k, _)| k.contains("id")).map(|(_, v)| v))

@@ -606,8 +606,7 @@ pub fn generate_singbox_config(
     }
 
     let node_tags: Vec<String> = nodes.iter().map(|n| n.tag().to_string()).collect();
-
-    // 预先准备好 outbounds 数组，避免在 json! 宏后手动修改
+    
     let mut outbound_list = vec![
         json!({ "type": "direct", "tag": "direct" }),
         json!({
