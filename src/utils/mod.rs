@@ -1,7 +1,7 @@
+use base64::prelude::*;
 use std::path::Path;
 use tokio::fs;
 use url::Url;
-use base64::prelude::*;
 
 pub mod browser;
 pub mod singbox;

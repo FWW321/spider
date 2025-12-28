@@ -11,10 +11,19 @@ use crate::utils::singbox::SingBoxController;
 use crate::utils::subscription::{self, ProxyNode};
 
 pub enum ProxyMsg {
-    GetNode { reply: Sender<Option<ProxyNode>> },
-    ReportSuccess { tag: String, latency: u128 },
-    ReportFailure { tag: String },
-    Rotate { reply: Option<tokio::sync::oneshot::Sender<()>> },
+    GetNode {
+        reply: Sender<Option<ProxyNode>>,
+    },
+    ReportSuccess {
+        tag: String,
+        latency: u128,
+    },
+    ReportFailure {
+        tag: String,
+    },
+    Rotate {
+        reply: Option<tokio::sync::oneshot::Sender<()>>,
+    },
 }
 
 pub struct ProxyManager {
@@ -38,7 +47,7 @@ impl ProxyManager {
                     error!("获取订阅失败: {}", e);
                     vec![]
                 });
-        
+
         debug!("成功获取 {} 个代理节点", nodes.len());
         info!("代理服务初始化完成");
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, Url};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -65,7 +65,10 @@ impl SingBoxController {
         }
 
         if !self.executable.exists() {
-            return Err(anyhow!("未找到 sing-box 执行文件: {}", self.executable.display()));
+            return Err(anyhow!(
+                "未找到 sing-box 执行文件: {}",
+                self.executable.display()
+            ));
         }
 
         let log_path = self.config_path.with_file_name("sing-box.log");
@@ -106,11 +109,12 @@ impl SingBoxController {
 
         timeout(Duration::from_secs(timeout_secs), async {
             loop {
-                match self.client
+                match self
+                    .client
                     .get(url.clone())
                     .bearer_auth(&self.api_secret)
                     .send()
-                    .await 
+                    .await
                 {
                     Ok(resp) if resp.status().is_success() => {
                         debug!("sing-box API 已就绪");
@@ -122,7 +126,7 @@ impl SingBoxController {
             }
         })
         .await
-        .map_err(|_| anyhow!("等待 sing-box API 超时"))??; 
+        .map_err(|_| anyhow!("等待 sing-box API 超时"))??;
 
         Ok(())
     }
@@ -132,7 +136,8 @@ impl SingBoxController {
         let url = self.api_base.join(&format!("proxies/{}", selector))?;
         let body = serde_json::json!({ "name": tag });
 
-        let resp = self.client
+        let resp = self
+            .client
             .put(url)
             .bearer_auth(&self.api_secret)
             .json(&body)
@@ -144,7 +149,10 @@ impl SingBoxController {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
                 "Failed to switch proxy ({} -> {}): Status {}, Body: {}",
-                selector, tag, status, text
+                selector,
+                tag,
+                status,
+                text
             ));
         }
 

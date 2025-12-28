@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chromiumoxide::{
+    Page,
     browser::{Browser, BrowserConfig},
     cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams,
-    Page,
 };
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -26,7 +26,7 @@ use crate::core::config::AppConfig;
 use crate::core::error::{Result, SpiderError};
 use crate::sites::{Bypasser, SiteContext};
 
-static STEALTH_JS: &str = include_str!("../../stealth.min.js"); 
+static STEALTH_JS: &str = include_str!("../../stealth.min.js");
 
 static UA_CACHE: OnceCell<String> = OnceCell::const_new();
 
@@ -37,9 +37,8 @@ pub struct BrowserSession {
 
 impl BrowserSession {
     pub async fn launch(config: &AppConfig) -> Result<Self> {
-
         let ua = UA_CACHE.get_or_init(Self::probe_native_ua).await;
-        
+
         let browser_config = Self::build_config(config, ua)?;
 
         let (browser, mut handler) = Browser::launch(browser_config)
@@ -48,7 +47,9 @@ impl BrowserSession {
 
         let handle = tokio::spawn(async move {
             while let Some(h) = handler.next().await {
-                if h.is_err() { break; }
+                if h.is_err() {
+                    break;
+                }
             }
         });
 
@@ -87,7 +88,8 @@ impl BrowserSession {
                 r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
             ];
-            default_paths.iter()
+            default_paths
+                .iter()
                 .find(|p| std::path::Path::new(p).exists())
                 .map(|p| p.to_string())
         };
@@ -128,11 +130,11 @@ impl BrowserSession {
 
     async fn probe_native_ua() -> String {
         debug!("正在探测原生浏览器 User-Agent...");
-        
+
         let config = match BrowserConfig::builder()
             .arg("--headless=new")
             .arg("--no-sandbox")
-            .build() 
+            .build()
         {
             Ok(c) => c,
             Err(_) => return Self::fallback_ua(),
@@ -145,7 +147,9 @@ impl BrowserSession {
 
         let handle = tokio::spawn(async move {
             while let Some(h) = handler.next().await {
-                if h.is_err() { break; }
+                if h.is_err() {
+                    break;
+                }
             }
         });
 
@@ -161,10 +165,12 @@ impl BrowserSession {
 
         match result {
             Ok(ua) => {
-                let clean_ua = ua.replace("HeadlessChrome", "Chrome").replace("Headless", "");
+                let clean_ua = ua
+                    .replace("HeadlessChrome", "Chrome")
+                    .replace("Headless", "");
                 debug!("浏览器 UA 探测成功: {}", clean_ua);
                 clean_ua
-            },
+            }
             Err(_) => Self::fallback_ua(),
         }
     }
@@ -199,7 +205,7 @@ impl Bypasser for CloudflareBypasser {
                     warn!("浏览器尝试失败，正在重试 ({}/{})", attempt, max_attempts);
                     debug!("错误详情: {}", e);
                     last_error = Some(e);
-                    
+
                     ctx.rotate_proxy().await;
                     sleep(Duration::from_secs(2)).await;
                 }
@@ -225,10 +231,10 @@ impl CloudflareBypasser {
     }
 
     async fn execute_page_logic(
-        &self, 
-        session: &BrowserSession, 
-        url: &str, 
-        ctx: &SiteContext
+        &self,
+        session: &BrowserSession,
+        url: &str,
+        ctx: &SiteContext,
     ) -> Result<()> {
         let page = session.new_page().await?;
 
@@ -246,7 +252,9 @@ impl CloudflareBypasser {
     async fn wait_for_challenge(&self, page: &Page) -> Result<()> {
         timeout(Duration::from_secs(20), async {
             loop {
-                let title = page.get_title().await
+                let title = page
+                    .get_title()
+                    .await
                     .unwrap_or(Some("".into()))
                     .unwrap_or_default()
                     .to_lowercase();
@@ -255,7 +263,7 @@ impl CloudflareBypasser {
                     return Err(SpiderError::SoftBlock("ip_blocked_in_browser".into()));
                 }
 
-                if !title.is_empty() 
+                if !title.is_empty()
                     && !title.contains("just a moment")
                     && !title.contains("cloudflare")
                 {
@@ -285,7 +293,7 @@ impl CloudflareBypasser {
                 .map(|c| format!("{}={}", c.name, c.value))
                 .collect::<Vec<_>>()
                 .join("; ");
-            
+
             debug!("成功提取 {} 个 Cookie", cookies.len());
             ctx.session.set_cookie(cookie_str);
         }
@@ -305,7 +313,7 @@ impl CloudflareBypasser {
             HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
         );
         headers.insert("Cache-Control", HeaderValue::from_static("max-age=0"));
-        
+
         ctx.session.set_headers(headers);
 
         Ok(())

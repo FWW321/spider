@@ -80,7 +80,7 @@ impl Task {
     ) -> Result<Vec<Task>> {
         if file_exists(&path).await {
             match tokio::fs::read_to_string(&path).await {
-                Ok(html) => {
+                Ok(html) if !html.is_empty() => {
                     debug!("跳过已存在章节: {}", chapter.title);
                     return Ok(Self::parse_images_from_html(
                         &html,
@@ -88,6 +88,7 @@ impl Task {
                         &ctx.images_dir,
                     ));
                 }
+                Ok(_) => debug!("本地章节文件内容为空: {}, 将重新下载", chapter.title),
                 Err(e) => debug!("读取本地章节失败: {}, 将重新下载", e),
             }
         }
@@ -269,9 +270,7 @@ impl ScrapeEngine {
     async fn generate_epub(&self, book: Book) -> Result<()> {
         info!("正在生成 EPUB 文件...");
         let generator = crate::core::epub::EpubGenerator::new(book.clone());
-        let output_path = book
-            .base_dir
-            .join(format!("{}.epub", book.unique_id()));
+        let output_path = book.base_dir.join(format!("{}.epub", book.unique_id()));
 
         match generator.run(Some(output_path)).await {
             Ok(path) => {
@@ -378,10 +377,7 @@ impl ScrapeEngine {
                 )
                 .replacen(
                     &format!("src='{}'", src),
-                    &format!(
-                        "src='{}' data-original-url='{}'",
-                        local_path, absolute_url
-                    ),
+                    &format!("src='{}' data-original-url='{}'", local_path, absolute_url),
                     1,
                 );
 

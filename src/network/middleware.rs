@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use flume::Sender;
 use http::{Extensions, HeaderValue, Method};
-use reqwest::{header, Request, Response, StatusCode, Url};
-use reqwest_middleware::{Middleware, Next, Result, Error};
+use reqwest::{Request, Response, StatusCode, Url, header};
+use reqwest_middleware::{Error, Middleware, Next, Result};
 use tracing::{debug, info, warn};
 
 // 假设这些是在 crate 中定义的，保持原样引用
@@ -37,14 +37,9 @@ pub struct ProxyMiddleware {
 
 #[async_trait::async_trait]
 impl Middleware for ProxyMiddleware {
-    async fn handle(
-        &self,
-        req: Request,
-        ext: &mut Extensions,
-        next: Next<'_>,
-    ) -> Result<Response> {
+    async fn handle(&self, req: Request, ext: &mut Extensions, next: Next<'_>) -> Result<Response> {
         let res = next.run(req, ext).await;
-        
+
         if let Err(e) = &res {
             if matches!(e, Error::Reqwest(e) if e.is_timeout() || e.is_connect()) {
                 let _ = self.proxy_actor.send(ProxyMsg::Rotate { reply: None });
@@ -98,9 +93,9 @@ pub struct AntiBlockMiddleware;
 impl AntiBlockMiddleware {
     fn resolve_redirect_url(base_url: &Url, res: &Response) -> Option<Url> {
         let loc = res.headers().get(header::LOCATION)?;
-        
+
         let loc_str = String::from_utf8_lossy(loc.as_bytes());
-        
+
         base_url.join(&loc_str).ok()
     }
 
@@ -117,12 +112,7 @@ impl AntiBlockMiddleware {
 
 #[async_trait::async_trait]
 impl Middleware for AntiBlockMiddleware {
-    async fn handle(
-        &self,
-        req: Request,
-        ext: &mut Extensions,
-        next: Next<'_>,
-    ) -> Result<Response> {
+    async fn handle(&self, req: Request, ext: &mut Extensions, next: Next<'_>) -> Result<Response> {
         let skip_recover = ext.get::<SkipAntiBlock>().is_some();
         if ext.get::<OriginalUrl>().is_none() {
             ext.insert(OriginalUrl(req.url().to_string()));
@@ -139,7 +129,7 @@ impl Middleware for AntiBlockMiddleware {
         if status.is_redirection() {
             if let Some(target_url) = Self::resolve_redirect_url(&current_url, &res) {
                 let redirect_count = ext.get::<RedirectCount>().map(|r| r.0).unwrap_or(0);
-                
+
                 if redirect_count >= MAX_REDIRECTS {
                     warn!("达到最大重定向次数 ({})", MAX_REDIRECTS);
                     return Ok(res);
@@ -147,10 +137,13 @@ impl Middleware for AntiBlockMiddleware {
 
                 debug!("跟随重定向: {} -> {}", status, target_url);
                 ext.insert(RedirectCount(redirect_count + 1));
-                
+
                 let mut new_req = Request::new(Method::GET, target_url);
-                new_req.headers_mut().insert(header::REFERER, HeaderValue::from_str(&current_referer).unwrap());
-                
+                new_req.headers_mut().insert(
+                    header::REFERER,
+                    HeaderValue::from_str(&current_referer).unwrap(),
+                );
+
                 return Box::pin(self.handle(new_req, ext, next)).await;
             }
         }
@@ -160,7 +153,7 @@ impl Middleware for AntiBlockMiddleware {
         }
 
         let Some(mw_ctx) = ext.get::<Arc<MiddlewareContext>>() else {
-             return Ok(res);
+            return Ok(res);
         };
 
         let headers = res.headers().clone();
@@ -169,18 +162,32 @@ impl Middleware for AntiBlockMiddleware {
         let bytes = res.bytes().await.map_err(reqwest_middleware::Error::from)?;
         let html = String::from_utf8_lossy(&bytes);
 
-        if let Err(SpiderError::SoftBlock(reason)) = mw_ctx.site.check_block(current_url.as_str(), &html, status.as_u16()) {
-            let original_url_str = ext.get::<OriginalUrl>().map(|u| u.0.clone()).unwrap_or_else(|| current_url.to_string());
+        if let Err(SpiderError::SoftBlock(reason)) =
+            mw_ctx
+                .site
+                .check_block(current_url.as_str(), &html, status.as_u16())
+        {
+            let original_url_str = ext
+                .get::<OriginalUrl>()
+                .map(|u| u.0.clone())
+                .unwrap_or_else(|| current_url.to_string());
             let attempts = ext.get::<RecoveryAttempts>().map(|r| r.0).unwrap_or(0);
 
             if attempts >= MAX_RECOVERY_ATTEMPTS {
-                warn!("达到最大阻断恢复重试次数 ({}): {}", MAX_RECOVERY_ATTEMPTS, original_url_str);
+                warn!(
+                    "达到最大阻断恢复重试次数 ({}): {}",
+                    MAX_RECOVERY_ATTEMPTS, original_url_str
+                );
                 return Err(reqwest_middleware::Error::from(anyhow::anyhow!(
                     SpiderError::SoftBlock(format!("{}:max_retries_exceeded", reason))
                 )));
             }
 
-            warn!("检测到访问阻断，正在重试 ({}/{})", attempts + 1, MAX_RECOVERY_ATTEMPTS);
+            warn!(
+                "检测到访问阻断，正在重试 ({}/{})",
+                attempts + 1,
+                MAX_RECOVERY_ATTEMPTS
+            );
             debug!("阻断详情: {} -> {}", original_url_str, reason);
 
             let recovered = mw_ctx
@@ -192,27 +199,23 @@ impl Middleware for AntiBlockMiddleware {
             if recovered {
                 info!("访问阻断已自动解除，继续执行任务...");
                 debug!("重试目标: {}", original_url_str);
-                
+
                 ext.insert(RedirectCount(0));
                 ext.insert(RecoveryAttempts(attempts + 1));
-                
+
                 let new_req = Request::new(Method::GET, original_url_str.parse().unwrap());
                 return Box::pin(self.handle(new_req, ext, next)).await;
             }
         }
 
-        let mut builder = http::Response::builder()
-            .status(status)
-            .version(version);
+        let mut builder = http::Response::builder().status(status).version(version);
 
         if let Some(h_map) = builder.headers_mut() {
             *h_map = headers;
         }
 
-        let response = builder
-            .body(bytes)
-            .unwrap();
-        
+        let response = builder.body(bytes).unwrap();
+
         Ok(Response::from(response))
     }
 }

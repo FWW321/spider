@@ -49,7 +49,11 @@ impl SiteContext {
 
     pub async fn rotate_proxy(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.proxy.send(ProxyMsg::Rotate { reply: Some(tx) }).is_ok() {
+        if self
+            .proxy
+            .send(ProxyMsg::Rotate { reply: Some(tx) })
+            .is_ok()
+        {
             let _ = rx.await;
             debug!("代理节点已完成物理切换");
         }

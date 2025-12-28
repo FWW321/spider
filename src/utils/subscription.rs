@@ -3,12 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
-use futures::{stream, StreamExt};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose};
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -198,7 +198,10 @@ fn parse_vmess(body: &str) -> Option<ProxyNode> {
 
     let transport = match v.get("net").and_then(|s| s.as_str()) {
         Some("ws") => Some(V2RayTransport::Websocket {
-            path: v.get("path").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            path: v
+                .get("path")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
             headers: v.get("host").and_then(|s| s.as_str()).map(|h| {
                 let mut m = HashMap::new();
                 m.insert("Host".to_string(), h.to_string());
@@ -221,11 +224,19 @@ fn parse_vmess(body: &str) -> Option<ProxyNode> {
 
     Some(ProxyNode {
         outbound: Outbound::Vmess {
-            tag: v.get("ps").and_then(|s| s.as_str()).unwrap_or("vmess").to_string(),
+            tag: v
+                .get("ps")
+                .and_then(|s| s.as_str())
+                .unwrap_or("vmess")
+                .to_string(),
             server: v.get("add")?.as_str()?.to_string(),
             server_port: json_as_u64(v.get("port")?)? as u16,
             uuid: v.get("id")?.as_str()?.to_string(),
-            security: v.get("scy").and_then(|s| s.as_str()).unwrap_or("auto").to_string(),
+            security: v
+                .get("scy")
+                .and_then(|s| s.as_str())
+                .unwrap_or("auto")
+                .to_string(),
             alter_id: v.get("aid").and_then(json_as_u64).unwrap_or(0) as u32,
             transport,
             tls,
@@ -241,7 +252,8 @@ fn parse_ss(line: &str) -> Option<ProxyNode> {
 
     // 尝试 SIP002 (ss://user:pass@host:port)
     if let (Some(host), Some(port)) = (url.host_str(), url.port()) {
-        let user_info = decode_base64_auto(url.username()).unwrap_or_else(|_| url.username().to_string());
+        let user_info =
+            decode_base64_auto(url.username()).unwrap_or_else(|_| url.username().to_string());
         let (method, password) = user_info.split_once(':')?;
         return Some(ProxyNode {
             outbound: Outbound::Shadowsocks {
@@ -278,7 +290,10 @@ fn parse_trojan(line: &str) -> Option<ProxyNode> {
 
     let tls = Some(TlsOutbound {
         enabled: true,
-        server_name: query.get("sni").map(|s| s.to_string()).or_else(|| url.host_str().map(|s| s.to_string())),
+        server_name: query
+            .get("sni")
+            .map(|s| s.to_string())
+            .or_else(|| url.host_str().map(|s| s.to_string())),
         insecure: Some(true),
         alpn: None,
         utls: None,
@@ -299,7 +314,8 @@ fn parse_trojan(line: &str) -> Option<ProxyNode> {
     Some(ProxyNode {
         outbound: Outbound::Trojan {
             tag: percent_encoding::percent_decode_str(url.fragment().unwrap_or("trojan"))
-                .decode_utf8_lossy().to_string(),
+                .decode_utf8_lossy()
+                .to_string(),
             server: url.host_str()?.to_string(),
             server_port: url.port()?,
             password: url.username().to_string(),
@@ -316,10 +332,16 @@ fn parse_vless(line: &str) -> Option<ProxyNode> {
     let tls = match query.get("security").map(|s| s.as_ref()) {
         Some("tls") | Some("xtls") => Some(TlsOutbound {
             enabled: true,
-            server_name: query.get("sni").map(|s| s.to_string()).or_else(|| url.host_str().map(|s| s.to_string())),
+            server_name: query
+                .get("sni")
+                .map(|s| s.to_string())
+                .or_else(|| url.host_str().map(|s| s.to_string())),
             insecure: Some(true),
             alpn: None,
-            utls: query.get("fp").map(|f| UtlsConfig { enabled: true, fingerprint: f.to_string() }),
+            utls: query.get("fp").map(|f| UtlsConfig {
+                enabled: true,
+                fingerprint: f.to_string(),
+            }),
         }),
         _ => None,
     };
@@ -334,7 +356,10 @@ fn parse_vless(line: &str) -> Option<ProxyNode> {
             }),
         }),
         Some("grpc") => Some(V2RayTransport::Grpc {
-            service_name: query.get("serviceName").map(|s| s.to_string()).unwrap_or_default(),
+            service_name: query
+                .get("serviceName")
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
         }),
         _ => None,
     };
@@ -342,7 +367,8 @@ fn parse_vless(line: &str) -> Option<ProxyNode> {
     Some(ProxyNode {
         outbound: Outbound::Vless {
             tag: percent_encoding::percent_decode_str(url.fragment().unwrap_or("vless"))
-                .decode_utf8_lossy().to_string(),
+                .decode_utf8_lossy()
+                .to_string(),
             server: url.host_str()?.to_string(),
             server_port: url.port()?,
             uuid: url.username().to_string(),
@@ -355,79 +381,128 @@ fn parse_vless(line: &str) -> Option<ProxyNode> {
 
 fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>> {
     let root: Value = serde_yml::from_str(content)?;
-    let proxies = root.get("proxies").and_then(|v| v.as_array()).context("No proxies found")?;
+    let proxies = root
+        .get("proxies")
+        .and_then(|v| v.as_array())
+        .context("No proxies found")?;
 
-    Ok(proxies.iter().filter_map(|p| {
-        let tag = p.get("name")?.as_str()?.to_string();
-        let server = p.get("server")?.as_str()?.to_string();
-        let port = p.get("port")?.as_u64()? as u16;
+    Ok(proxies
+        .iter()
+        .filter_map(|p| {
+            let tag = p.get("name")?.as_str()?.to_string();
+            let server = p.get("server")?.as_str()?.to_string();
+            let port = p.get("port")?.as_u64()? as u16;
 
-        let transport = match p.get("network").and_then(|v| v.as_str()) {
-            Some("ws") => Some(V2RayTransport::Websocket {
-                path: p.get("ws-opts").and_then(|o| o.get("path")).and_then(|v| v.as_str()).map(String::from),
-                headers: p.get("ws-opts").and_then(|o| o.get("headers")).and_then(|v| serde_json::from_value(v.clone()).ok()),
-            }),
-            Some("grpc") => Some(V2RayTransport::Grpc {
-                service_name: p.get("grpc-opts").and_then(|o| o.get("grpc-service-name")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            }),
-            _ => None,
-        };
+            let transport = match p.get("network").and_then(|v| v.as_str()) {
+                Some("ws") => Some(V2RayTransport::Websocket {
+                    path: p
+                        .get("ws-opts")
+                        .and_then(|o| o.get("path"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    headers: p
+                        .get("ws-opts")
+                        .and_then(|o| o.get("headers"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                }),
+                Some("grpc") => Some(V2RayTransport::Grpc {
+                    service_name: p
+                        .get("grpc-opts")
+                        .and_then(|o| o.get("grpc-service-name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                }),
+                _ => None,
+            };
 
-        let tls = p.get("tls").and_then(|v| v.as_bool()).unwrap_or(false).then(|| TlsOutbound {
-            enabled: true,
-            server_name: p.get("servername").and_then(|v| v.as_str()).map(String::from),
-            insecure: Some(p.get("skip-cert-verify").and_then(|v| v.as_bool()).unwrap_or(true)),
-            alpn: None,
-            utls: None,
-        });
+            let tls = p
+                .get("tls")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                .then(|| TlsOutbound {
+                    enabled: true,
+                    server_name: p
+                        .get("servername")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    insecure: Some(
+                        p.get("skip-cert-verify")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                    ),
+                    alpn: None,
+                    utls: None,
+                });
 
-        let outbound = match p.get("type")?.as_str()? {
-            "ss" => Outbound::Shadowsocks {
-                tag, server, server_port: port,
-                method: p.get("cipher")?.as_str()?.to_string(),
-                password: p.get("password")?.as_str()?.to_string(),
-            },
-            "vmess" => Outbound::Vmess {
-                tag, server, server_port: port,
-                uuid: p.get("uuid")?.as_str()?.to_string(),
-                security: p.get("cipher").and_then(|v| v.as_str()).unwrap_or("auto").to_string(),
-                alter_id: p.get("alterId").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                transport,
-                tls,
-            },
-            "vless" => Outbound::Vless {
-                tag, server, server_port: port,
-                uuid: p.get("uuid")?.as_str()?.to_string(),
-                flow: p.get("flow").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                transport,
-                tls,
-            },
-            "trojan" => Outbound::Trojan {
-                tag, server, server_port: port,
-                password: p.get("password")?.as_str()?.to_string(),
-                tls,
-                transport,
-            },
-            _ => return None,
-        };
-        
-        let node = ProxyNode { outbound };
-        is_valid_node(&node).then_some(node)
-    }).collect())
+            let outbound = match p.get("type")?.as_str()? {
+                "ss" => Outbound::Shadowsocks {
+                    tag,
+                    server,
+                    server_port: port,
+                    method: p.get("cipher")?.as_str()?.to_string(),
+                    password: p.get("password")?.as_str()?.to_string(),
+                },
+                "vmess" => Outbound::Vmess {
+                    tag,
+                    server,
+                    server_port: port,
+                    uuid: p.get("uuid")?.as_str()?.to_string(),
+                    security: p
+                        .get("cipher")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("auto")
+                        .to_string(),
+                    alter_id: p.get("alterId").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    transport,
+                    tls,
+                },
+                "vless" => Outbound::Vless {
+                    tag,
+                    server,
+                    server_port: port,
+                    uuid: p.get("uuid")?.as_str()?.to_string(),
+                    flow: p
+                        .get("flow")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    transport,
+                    tls,
+                },
+                "trojan" => Outbound::Trojan {
+                    tag,
+                    server,
+                    server_port: port,
+                    password: p.get("password")?.as_str()?.to_string(),
+                    tls,
+                    transport,
+                },
+                _ => return None,
+            };
+
+            let node = ProxyNode { outbound };
+            is_valid_node(&node).then_some(node)
+        })
+        .collect())
 }
 
 fn is_valid_node(node: &ProxyNode) -> bool {
-    const BLOCKLIST: &[&str] = &["广告", "官网", "流量", "重置", "群", "客服", "更新", "订阅", "expire"];
+    const BLOCKLIST: &[&str] = &[
+        "广告", "官网", "流量", "重置", "群", "客服", "更新", "订阅", "expire",
+    ];
     let tag = node.tag();
-    
+
     // 检查关键字
-    if BLOCKLIST.iter().any(|&k| tag.contains(k)) { return false; }
-    
+    if BLOCKLIST.iter().any(|&k| tag.contains(k)) {
+        return false;
+    }
+
     // 检查本地地址
     match &node.outbound {
-        Outbound::Shadowsocks { server, .. } 
-        | Outbound::Vmess { server, .. } 
-        | Outbound::Vless { server, .. } 
+        Outbound::Shadowsocks { server, .. }
+        | Outbound::Vmess { server, .. }
+        | Outbound::Vless { server, .. }
         | Outbound::Trojan { server, .. } => server != "127.0.0.1" && server != "localhost",
     }
 }
@@ -436,7 +511,10 @@ fn is_valid_node(node: &ProxyNode) -> bool {
 
 pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Result<Vec<ProxyNode>> {
     #[derive(Serialize, Deserialize)]
-    struct Cache { hash: String, nodes: Vec<ProxyNode> }
+    struct Cache {
+        hash: String,
+        nodes: Vec<ProxyNode>,
+    }
 
     let hash = blake3::hash(urls.join(",").as_bytes()).to_hex().to_string();
     let cache_file = cache_path.join("sub_cache.json");
@@ -461,11 +539,21 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
             let client = client.clone();
             async move {
                 debug!("正在获取订阅: {}", url);
-                client.get(url).send().await
-                    .map_err(|e| { warn!("订阅请求失败 {}: {}", url, e); e })
+                client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        warn!("订阅请求失败 {}: {}", url, e);
+                        e
+                    })
                     .ok()?
-                    .text().await
-                    .map_err(|e| { warn!("读取订阅内容失败 {}: {}", url, e); e })
+                    .text()
+                    .await
+                    .map_err(|e| {
+                        warn!("读取订阅内容失败 {}: {}", url, e);
+                        e
+                    })
                     .ok()
             }
         })
@@ -473,7 +561,7 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
 
     let mut all_nodes = Vec::new();
     let results: Vec<Option<String>> = fetches.collect().await;
-    
+
     for content in results.into_iter().flatten() {
         if let Ok(nodes) = parse_subscription_content(&content) {
             all_nodes.extend(nodes);
@@ -491,8 +579,13 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
     }
 
     if !all_nodes.is_empty() {
-        if let Some(parent) = cache_file.parent() { let _ = tokio::fs::create_dir_all(parent).await; }
-        let cache = Cache { hash, nodes: all_nodes.clone() };
+        if let Some(parent) = cache_file.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let cache = Cache {
+            hash,
+            nodes: all_nodes.clone(),
+        };
         if let Ok(json) = serde_json::to_string(&cache) {
             let _ = tokio::fs::write(cache_file, json).await;
         }
@@ -508,10 +601,12 @@ pub fn generate_singbox_config(
     api_secret: &str,
     cache_path: &Path,
 ) -> Result<String> {
-    if nodes.is_empty() { return Err(anyhow!("No proxy nodes")); }
+    if nodes.is_empty() {
+        return Err(anyhow!("No proxy nodes"));
+    }
 
     let node_tags: Vec<String> = nodes.iter().map(|n| n.tag().to_string()).collect();
-    
+
     // 预先准备好 outbounds 数组，避免在 json! 宏后手动修改
     let mut outbound_list = vec![
         json!({ "type": "direct", "tag": "direct" }),
@@ -523,7 +618,7 @@ pub fn generate_singbox_config(
             "interrupt_exist_connections": true
         }),
     ];
-    
+
     // 批量转换节点并添加到列表
     for node in nodes {
         outbound_list.push(serde_json::to_value(&node.outbound)?);

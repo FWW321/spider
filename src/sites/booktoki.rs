@@ -65,7 +65,10 @@ pub struct Booktoki {
 
 impl Booktoki {
     pub fn new(config: SiteConfig) -> Self {
-        let base_url = config.base_url.as_deref().unwrap_or("https://booktoki469.com");
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://booktoki469.com");
         Self {
             base: Url::parse(base_url).expect("Invalid base URL"),
             config,
@@ -101,7 +104,9 @@ impl UrlBuilder for Booktoki {
     fn build_url(&self, kind: &str, args: &TaskArgs) -> Result<String> {
         match kind {
             "metadata" | "chapters" => {
-                let id = args.get("id").ok_or_else(|| SpiderError::Parse("Missing id".into()))?;
+                let id = args
+                    .get("id")
+                    .ok_or_else(|| SpiderError::Parse("Missing id".into()))?;
                 Ok(self.normalize(&format!("/novel/{}", id)))
             }
             _ => Err(SpiderError::Parse(format!("Unknown kind: {}", kind))),
@@ -114,12 +119,13 @@ impl Parser for Booktoki {
         let doc = Html::parse_document(html);
         let s = SiteSelectors::get();
 
-        let detail = doc.select(&s.detail_desc).next().ok_or_else(|| {
-            SpiderError::Parse("Detail element not found".into())
-        })?;
+        let detail = doc
+            .select(&s.detail_desc)
+            .next()
+            .ok_or_else(|| SpiderError::Parse("Detail element not found".into()))?;
 
         let mut contents = detail.select(&s.view_content);
-        
+
         let title = contents
             .next()
             .and_then(|el| el.select(&s.bold).next())
@@ -129,7 +135,7 @@ impl Parser for Booktoki {
         let (mut author, mut tags, mut publisher) = (None, Vec::new(), None);
         if let Some(info) = contents.next() {
             author = self.extract_icon_text(&info, &s.icon_user);
-            
+
             if let Some(tag_str) = self.extract_icon_text(&info, &s.icon_tags) {
                 tags = tag_str.split(',').map(|s| s.trim().to_string()).collect();
             }
@@ -139,9 +145,9 @@ impl Parser for Booktoki {
             }
         }
 
-        let summary = contents.next().map(|el| {
-            el.text().collect::<Vec<_>>().join("\n").trim().to_string()
-        });
+        let summary = contents
+            .next()
+            .map(|el| el.text().collect::<Vec<_>>().join("\n").trim().to_string());
 
         let cover_url = detail
             .select(&s.view_img)
@@ -180,7 +186,9 @@ impl Parser for Booktoki {
             .filter_map(|item| {
                 let link = item.select(&s.wr_subject_link).next()?;
                 let url = link.value().attr("href")?.to_string();
-                if url.is_empty() { return None; }
+                if url.is_empty() {
+                    return None;
+                }
 
                 let id = item
                     .select(&s.wr_num)
@@ -216,14 +224,16 @@ impl Parser for Booktoki {
     }
 
     fn parse_content(&self, html: &str) -> Result<(String, Option<String>)> {
-       
         let doc = Html::parse_document(html);
         let s = SiteSelectors::get();
 
         let node = match doc.select(&s.novel_content).next() {
             Some(n) => n,
             None => {
-                return Err(SpiderError::Parse("Novel content container not found".into()));
+                self.save_failed_html(html);
+                return Err(SpiderError::Parse(
+                    "Novel content container not found".into(),
+                ));
             }
         };
 
@@ -232,9 +242,9 @@ impl Parser for Booktoki {
             .filter_map(|p| {
                 let text = p.text().collect::<String>();
                 let trimmed = text.trim();
-                
-                let is_spam = trimmed.len() > 40 
-                    && !trimmed.is_empty() 
+
+                let is_spam = trimmed.len() > 40
+                    && !trimmed.is_empty()
                     && trimmed.chars().all(|c| c.is_alphanumeric());
 
                 if is_spam {
@@ -259,15 +269,13 @@ impl Guardian for Booktoki {
             debug!("检测到 Cloudflare 阻断: {}", url);
             return Err(SpiderError::SoftBlock("cloudflare".into()));
         }
-        
+
         if status == 403 {
             debug!("检测到 403 禁止访问: {}", url);
             return Err(SpiderError::SoftBlock("ip_blocked".into()));
         }
 
-        if url.contains("captcha") 
-            || lower.contains("id=\"captcha\"") 
-        {
+        if url.contains("captcha") || lower.contains("id=\"captcha\"") {
             debug!("检测到验证码页面或异常访问: {}", url);
             return Err(SpiderError::SoftBlock("captcha".into()));
         }
@@ -319,11 +327,16 @@ impl Booktoki {
 
         let session_url = self.normalize("/plugin/kcaptcha/kcaptcha_session.php");
         // 获取 Session 时也不要通过中间件，避免死锁
-        ctx.http.post(&session_url, &json!({}), ctx.session.clone(), None).await?;
+        ctx.http
+            .post(&session_url, &json!({}), ctx.session.clone(), None)
+            .await?;
 
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
         let img_url = self.normalize(&format!("/plugin/kcaptcha/kcaptcha_image.php?t={}", ts));
-        
+
         let (status, bytes) = match ctx.http.get(&img_url, ctx.session.clone(), None).await {
             Ok(res) => (res.status(), res.bytes().await.unwrap_or_default()),
             Err(e) => {
@@ -339,7 +352,7 @@ impl Booktoki {
             ctx.session.clear();
             ctx.rotate_proxy().await;
             tokio::time::sleep(Duration::from_secs(1)).await;
-            
+
             if let Err(e) = ctx.bypasser.bypass(url, ctx).await {
                 warn!("验证码流程中尝试绕过阻断失败: {}", e);
             }
@@ -348,13 +361,18 @@ impl Booktoki {
         }
 
         if !status.is_success() || bytes.is_empty() {
-             return Err(SpiderError::SoftBlock(format!("captcha_img_fetch_failed:{}", status)));
+            return Err(SpiderError::SoftBlock(format!(
+                "captcha_img_fetch_failed:{}",
+                status
+            )));
         }
 
         let code = match booktoki_captcha::solve_captcha(&bytes) {
             Ok(code) => code,
             Err(_) => {
-                let _ = self.save_failed_captcha(&bytes, &ctx.config.cache_path).await;
+                let _ = self
+                    .save_failed_captcha(&bytes, &ctx.config.cache_path)
+                    .await;
                 return Err(SpiderError::CaptchaFailed);
             }
         };
@@ -367,8 +385,31 @@ impl Booktoki {
         ];
 
         // 提交时同样绕过中间件
-        ctx.http.post_form(&submit_url, &form, ctx.session.clone(), None).await?;
+        ctx.http
+            .post_form(&submit_url, &form, ctx.session.clone(), None)
+            .await?;
         Ok(())
+    }
+
+    fn save_failed_html(&self, html: &str) {
+        let cache_dir = PathBuf::from("cache").join("html_failed");
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            warn!("无法创建缓存目录: {}", e);
+            return;
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let filename = format!("failed_content_{}.html", timestamp);
+        let filepath = cache_dir.join(&filename);
+
+        if let Err(e) = std::fs::write(&filepath, html) {
+            warn!("无法保存失败的 HTML: {}", e);
+        } else {
+            info!("已保存失败的 HTML 到: {}", filepath.display());
+        }
     }
 
     async fn save_failed_captcha(&self, img: &[u8], cache_path: &str) -> Result<()> {

@@ -69,7 +69,11 @@ async fn main() -> anyhow::Result<()> {
             let site: Arc<dyn Site> = match registry.create(&site_id, site_cfg) {
                 Some(s) => Arc::from(s),
                 None => {
-                    error!("未知的站点类型: {}。可用站点: {:?}", site_id, registry.list());
+                    error!(
+                        "未知的站点类型: {}。可用站点: {:?}",
+                        site_id,
+                        registry.list()
+                    );
                     return Ok(());
                 }
             };
