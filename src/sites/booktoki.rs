@@ -313,27 +313,44 @@ impl Guardian for Booktoki {
 
 impl Booktoki {
     async fn solve_captcha(&self, url: &str, ctx: &SiteContext) -> Result<()> {
-        debug!("正在获取验证码会话...");
+        let max_attempts = ctx.config.spider.retry_count;
 
-        let session_url = self.normalize("/plugin/kcaptcha/kcaptcha_session.php");
-        ctx.http.post(&session_url, &json!({}), ctx.session.clone(), None).await?;
+        for attempt in 1..=max_attempts {
+            debug!("正在获取验证码会话... (尝试 {}/{})", attempt, max_attempts);
 
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-        let img_url = self.normalize(&format!("/plugin/kcaptcha/kcaptcha_image.php?t={}", ts));
-        let img = ctx.http.get_bytes(&img_url, ctx.session.clone(), None).await?;
+            let session_url = self.normalize("/plugin/kcaptcha/kcaptcha_session.php");
+            ctx.http.post(&session_url, &json!({}), ctx.session.clone(), None).await?;
 
-        let code = booktoki_captcha::solve_captcha(&img)
-            .map_err(|_| SpiderError::CaptchaFailed)?;
-        info!("验证码识别成功: {}", code);
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+            let img_url = self.normalize(&format!("/plugin/kcaptcha/kcaptcha_image.php?t={}", ts));
+            let img = ctx.http.get_bytes(&img_url, ctx.session.clone(), None).await?;
 
-        let submit_url = self.normalize("/bbs/captcha_check.php");
-        let form = vec![
-            ("url".to_string(), url.to_string()),
-            ("captcha_key".to_string(), code), 
-        ];
-        
-        ctx.http.post_form(&submit_url, &form, ctx.session.clone(), None).await?;
-        Ok(())
+            match booktoki_captcha::solve_captcha(&img) {
+                Ok(code) => {
+                    info!("验证码识别成功: {}", code);
+
+                    let submit_url = self.normalize("/bbs/captcha_check.php");
+                    let form = vec![
+                        ("url".to_string(), url.to_string()),
+                        ("captcha_key".to_string(), code),
+                    ];
+
+                    ctx.http.post_form(&submit_url, &form, ctx.session.clone(), None).await?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    if attempt < max_attempts {
+                        debug!("验证码识别失败，等待后重试...");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    } else {
+                        debug!("验证码识别失败，已达到最大重试次数");
+                        return Err(SpiderError::CaptchaFailed);
+                    }
+                }
+            }
+        }
+
+        Err(SpiderError::CaptchaFailed)
     }
 }
 
