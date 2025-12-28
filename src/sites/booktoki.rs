@@ -60,7 +60,7 @@ impl SiteSelectors {
 pub struct Booktoki {
     config: SiteConfig,
     base: Url,
-    recovery_lock: Mutex<()>,
+    recovery_lock: Mutex<Option<SystemTime>>,
 }
 
 impl Booktoki {
@@ -72,7 +72,7 @@ impl Booktoki {
         Self {
             base: Url::parse(base_url).expect("Invalid base URL"),
             config,
-            recovery_lock: Mutex::new(()),
+            recovery_lock: Mutex::new(None),
         }
     }
 
@@ -284,12 +284,24 @@ impl Guardian for Booktoki {
     }
 
     async fn recover(&self, url: &str, reason: &str, ctx: &SiteContext) -> Result<bool> {
-        let _guard = self.recovery_lock.lock().await;
+        let start_waiting = SystemTime::now();
+        let mut last_recovered = self.recovery_lock.lock().await;
+
+        // 如果在等待期间已经被修复，则直接返回
+        if let Some(time) = *last_recovered {
+            if time > start_waiting {
+                debug!("页面已由其他任务在等待期间恢复，跳过探测");
+                return Ok(true);
+            }
+        }
+
         debug!("开始阻断恢复: {} (原因: {})", url, reason);
 
+        // Leader需要再次探测页面状态，防止成为受害者
         if let Ok((status, html)) = ctx.probe(url).await {
             if self.check_block(url, &html, status).is_ok() {
-                debug!("页面已由其他任务恢复");
+                debug!("页面经探测已恢复");
+                *last_recovered = Some(SystemTime::now());
                 return Ok(true);
             }
         }
@@ -317,6 +329,7 @@ impl Guardian for Booktoki {
             }
         }
 
+        *last_recovered = Some(SystemTime::now());
         Ok(true)
     }
 }
