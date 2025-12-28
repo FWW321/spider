@@ -35,6 +35,7 @@ pub struct SiteContext {
     pub http: Arc<HttpService>,
     pub session: Arc<Session>,
     pub bypasser: Arc<dyn Bypasser>,
+    pub site: Option<Arc<dyn Site>>,
 }
 
 impl SiteContext {
@@ -52,6 +53,16 @@ impl SiteContext {
             let _ = rx.await;
             debug!("代理节点已完成物理切换");
         }
+    }
+
+    /// 构建中间件上下文（如果 site 可用）
+    pub fn mw_context(&self) -> Option<Arc<MiddlewareContext>> {
+        self.site.as_ref().map(|site| {
+            Arc::new(MiddlewareContext {
+                site: site.clone(),
+                ctx: self.clone(),
+            })
+        })
     }
 }
 

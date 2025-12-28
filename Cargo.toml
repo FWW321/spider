@@ -1,10 +1,10 @@
 [package]
 name = "spider"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs"] }
 futures = "0.3"
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "socks", "cookies", "stream", "multipart"] }
@@ -27,7 +27,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
-directories = "6.0" # Standard storage paths
+directories = "6.0"
 clap = { version = "4.4", features = ["derive"] }
 epub-builder = "0.8"
 mime_guess = "2.0"

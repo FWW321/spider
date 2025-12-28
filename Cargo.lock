@@ -6235,7 +6235,7 @@ dependencies = [
 
 [[package]]
 name = "spider"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6740,7 +6740,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

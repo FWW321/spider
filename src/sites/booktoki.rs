@@ -1,11 +1,13 @@
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use scraper::{ElementRef, Html, Selector};
 use serde_json::json;
+use tokio::fs;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::core::config::SiteConfig;
@@ -313,44 +315,76 @@ impl Guardian for Booktoki {
 
 impl Booktoki {
     async fn solve_captcha(&self, url: &str, ctx: &SiteContext) -> Result<()> {
-        let max_attempts = ctx.config.spider.retry_count;
+        debug!("正在获取验证码会话...");
 
-        for attempt in 1..=max_attempts {
-            debug!("正在获取验证码会话... (尝试 {}/{})", attempt, max_attempts);
+        let session_url = self.normalize("/plugin/kcaptcha/kcaptcha_session.php");
+        // 获取 Session 时也不要通过中间件，避免死锁
+        ctx.http.post(&session_url, &json!({}), ctx.session.clone(), None).await?;
 
-            let session_url = self.normalize("/plugin/kcaptcha/kcaptcha_session.php");
-            ctx.http.post(&session_url, &json!({}), ctx.session.clone(), None).await?;
-
-            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-            let img_url = self.normalize(&format!("/plugin/kcaptcha/kcaptcha_image.php?t={}", ts));
-            let img = ctx.http.get_bytes(&img_url, ctx.session.clone(), None).await?;
-
-            match booktoki_captcha::solve_captcha(&img) {
-                Ok(code) => {
-                    info!("验证码识别成功: {}", code);
-
-                    let submit_url = self.normalize("/bbs/captcha_check.php");
-                    let form = vec![
-                        ("url".to_string(), url.to_string()),
-                        ("captcha_key".to_string(), code),
-                    ];
-
-                    ctx.http.post_form(&submit_url, &form, ctx.session.clone(), None).await?;
-                    return Ok(());
-                }
-                Err(_) => {
-                    if attempt < max_attempts {
-                        debug!("验证码识别失败，等待后重试...");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    } else {
-                        debug!("验证码识别失败，已达到最大重试次数");
-                        return Err(SpiderError::CaptchaFailed);
-                    }
-                }
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let img_url = self.normalize(&format!("/plugin/kcaptcha/kcaptcha_image.php?t={}", ts));
+        
+        let (status, bytes) = match ctx.http.get(&img_url, ctx.session.clone(), None).await {
+            Ok(res) => (res.status(), res.bytes().await.unwrap_or_default()),
+            Err(e) => {
+                warn!("获取验证码图片失败: {}", e);
+                // 网络错误也尝试切换代理
+                ctx.rotate_proxy().await;
+                return Box::pin(self.solve_captcha(url, ctx)).await;
             }
+        };
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            warn!("获取验证码图片被拒 (403)，正在切换线路重试...");
+            ctx.session.clear();
+            ctx.rotate_proxy().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            
+            if let Err(e) = ctx.bypasser.bypass(url, ctx).await {
+                warn!("验证码流程中尝试绕过阻断失败: {}", e);
+            }
+
+            return Box::pin(self.solve_captcha(url, ctx)).await;
         }
 
-        Err(SpiderError::CaptchaFailed)
+        if !status.is_success() || bytes.is_empty() {
+             return Err(SpiderError::SoftBlock(format!("captcha_img_fetch_failed:{}", status)));
+        }
+
+        let code = match booktoki_captcha::solve_captcha(&bytes) {
+            Ok(code) => code,
+            Err(_) => {
+                let _ = self.save_failed_captcha(&bytes, &ctx.config.cache_path).await;
+                return Err(SpiderError::CaptchaFailed);
+            }
+        };
+        info!("验证码识别成功: {}", code);
+
+        let submit_url = self.normalize("/bbs/captcha_check.php");
+        let form = vec![
+            ("url".to_string(), url.to_string()),
+            ("captcha_key".to_string(), code),
+        ];
+
+        // 提交时同样绕过中间件
+        ctx.http.post_form(&submit_url, &form, ctx.session.clone(), None).await?;
+        Ok(())
+    }
+
+    async fn save_failed_captcha(&self, img: &[u8], cache_path: &str) -> Result<()> {
+        let captcha_dir = PathBuf::from(cache_path).join("captcha");
+        fs::create_dir_all(&captcha_dir).await?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let filename = format!("captcha_failed_{}.jpg", timestamp);
+        let filepath = captcha_dir.join(&filename);
+
+        fs::write(&filepath, img).await?;
+        info!("已保存失败的验证码图片到: {}", filepath.display());
+        Ok(())
     }
 }
 
