@@ -1,0 +1,48 @@
+[package]
+name = "spider"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "socks", "cookies", "stream", "multipart"] }
+reqwest-middleware = "0.4"
+reqwest-retry = "0.8"
+http = "1.0"
+url = "2.5"
+bytes = "1.6"
+chromiumoxide = { version = "0.8", features = ["tokio-runtime"] }
+scraper = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+flume = "0.12"
+config = "0.15"
+bon = "3.8"
+thiserror = "2.0"
+anyhow = "1.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+directories = "6.0" # Standard storage paths
+clap = { version = "4.4", features = ["derive"] }
+epub-builder = "0.8"
+mime_guess = "2.0"
+booktoki_captcha = { git = "https://github.com/FWW321/booktoki_captcha.git", branch = "master" }
+blake3 = "1.8.2"
+parking_lot = "0.12"
+percent-encoding = "2.3.2"
+
+[[bin]]
+name = "spider"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"

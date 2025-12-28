@@ -1,0 +1,29 @@
+# 配置文件示例
+
+# 基础路径配置
+cache_path = "cache"  # 缓存、日志和下载数据的存储目录
+
+[singbox]
+bin_path = "bin"              # sing-box 可执行文件所在的目录
+proxy_port = 2080             # 本地 HTTP 代理监听端口
+api_port = 9090               # SingBox 控制 API 端口
+api_secret = "your_secret"    # API 认证密钥
+# 代理订阅地址列表
+subscription_urls = [
+    "https://example.com/subscribe?token=xxx",
+    "https://another.com/link"
+]
+
+[browser]
+headless = true               # 是否开启无头模式 (true: 不显示浏览器窗口)
+# 如果没有安装 Chrome，可以指定 Edge 的路径：
+# chrome_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+
+[spider]
+concurrency = 5               # 全局最大并发采集任务数
+retry_count = 3               # 请求失败时的最大重试次数
+
+# 站点特定配置
+[sites.booktoki]
+base_url = "https://booktoki469.com" # 站点基础 URL
+concurrent_tasks = 3                 # 该站点的并发限制 (覆盖全局配置)
