@@ -1,3 +1,7 @@
+//! EPUB 编译引擎 (EPUB Compilation Engine)
+//!
+//! 负责将领域模型 (Book/Chapter) 序列化为符合 IDPF 规范的 EPUB 容器 (OCF 结构)。
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,9 +11,13 @@ use tokio::fs;
 
 use crate::core::model::{Book, BookItem, Chapter, Volume};
 
+/// EPUB 文档生成器
 pub struct EpubGenerator {
+    /// 待编译的书籍聚合模型
     book: Book,
+    /// 内部文本资源路径映射
     chapter_dir: String,
+    /// 内部静态资源路径映射
     image_dir: String,
 }
 
@@ -22,6 +30,9 @@ impl EpubGenerator {
         }
     }
 
+    /// 执行文档编译流水线
+    /// 
+    /// 元数据注入、目录树构建、静态资源打包及最终 ZIP 压缩。
     pub async fn run<P: AsRef<Path>>(&self, output_path: Option<P>) -> Result<PathBuf> {
         let mut builder = EpubBuilder::new(ZipLibrary::new().map_err(|e| anyhow::anyhow!(e))?)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -35,20 +46,21 @@ impl EpubGenerator {
             None => PathBuf::from(format!("{}.epub", self.book.id)),
         };
 
-        // 将 CPU 密集型 (ZIP 压缩) 和 阻塞 I/O 操作卸载到专用线程池
         let final_path_clone = final_path.clone();
+        // 将 CPU 密集型任务 (ZIP 压缩) 卸载至专用线程池 (Task Offloading)
         tokio::task::spawn_blocking(move || -> Result<()> {
             let file = std::fs::File::create(&final_path_clone)
-                .with_context(|| format!("创建文件失败: {:?}", final_path_clone))?;
+                .with_context(|| format!("Failed to create artifact: {:?}", final_path_clone))?;
             builder.generate(file).map_err(|e| anyhow::anyhow!(e))?;
             Ok(())
         })
         .await
-        .map_err(|e| anyhow::anyhow!("JoinError: {}", e))??;
+        .map_err(|e| anyhow::anyhow!("Worker join error: {}", e))??;
 
         Ok(final_path)
     }
 
+    /// 注入书籍元数据 (Dublin Core Metadata)
     async fn configure_metadata(&self, builder: &mut EpubBuilder<ZipLibrary>) -> Result<()> {
         let meta = &self.book.metadata;
 
@@ -59,17 +71,8 @@ impl EpubGenerator {
         }
 
         if let Some(summary) = &meta.summary {
-            // epub-builder 0.7+ set_description takes Vec<String>
             builder.set_description(vec![summary.to_string()]);
         }
-
-        /*
-        // 设置出版商：优先使用元数据中的 publisher，否则使用 site_id
-        let publisher = meta.publisher.as_ref().unwrap_or(&self.book.site_id);
-        builder
-            .metadata("publisher", publisher)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        */
 
         builder.set_lang(&meta.language);
 
@@ -77,7 +80,7 @@ impl EpubGenerator {
             builder.add_subject(tag);
         }
 
-        // 处理封面
+        // 封面资源嵌入与元数据关联
         if let Some(cover_name) = meta.cover_filename() {
             let cover_path = self.book.cover_dir().await.join(&cover_name);
             if cover_path.exists() {
@@ -94,6 +97,7 @@ impl EpubGenerator {
         Ok(())
     }
 
+    /// 递归构建文档结构树 (TOC Structure)
     async fn build_structure(&self, builder: &mut EpubBuilder<ZipLibrary>) -> Result<()> {
         for item in &self.book.items {
             match item {
@@ -108,6 +112,7 @@ impl EpubGenerator {
         Ok(())
     }
 
+    /// 添加章节实体并执行 HTML 内容包装
     async fn add_chapter(
         &self,
         builder: &mut EpubBuilder<ZipLibrary>,
@@ -128,7 +133,6 @@ impl EpubGenerator {
             format!("<h1>{}</h1><div id=\"content\"></div>", chapter.title)
         };
 
-        // 包装成完整的 XHTML
         let xhtml_content = self.wrap_html(&chapter.title, &content);
 
         let mut epub_content =
@@ -145,6 +149,7 @@ impl EpubGenerator {
         Ok(file_name)
     }
 
+    /// 添加卷索引及其嵌套层级
     async fn add_volume(
         &self,
         builder: &mut EpubBuilder<ZipLibrary>,
@@ -159,7 +164,6 @@ impl EpubGenerator {
             )
         };
 
-        // 始终为卷生成一个页面，以保持 TOC 结构的嵌套关系
         let file_name = format!("{}/volume_{}.xhtml", self.chapter_dir, volume.id);
         let xhtml_content = self.wrap_html(volume_title, &volume_content);
 
@@ -171,7 +175,6 @@ impl EpubGenerator {
             )
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        // 添加卷内章节，层级设为 1（add_chapter 内部会自动 +1 变为 Level 2）
         for chapter in &volume.chapters {
             self.add_chapter(builder, chapter, Some(1)).await?;
         }
@@ -179,6 +182,7 @@ impl EpubGenerator {
         Ok(())
     }
 
+    /// 批量打包静态媒体资源
     async fn add_image_items(&self, builder: &mut EpubBuilder<ZipLibrary>) -> Result<()> {
         let images_dir = self.book.images_dir().await;
         if !images_dir.exists() {
@@ -207,6 +211,7 @@ impl EpubGenerator {
         Ok(())
     }
 
+    /// 应用 XHTML 1.1 标准模板包装
     fn wrap_html(&self, title: &str, body: &str) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>

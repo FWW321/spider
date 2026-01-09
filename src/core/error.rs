@@ -1,5 +1,48 @@
-use thiserror::Error;
+//! 错误处理体系 (Error Handling System)
+//!
+//! 定义领域相关的错误类型、异常阻断原因以及全局 Result 别名。
 
+use thiserror::Error;
+use reqwest::StatusCode;
+
+/// 系统阻断原因枚举 (Block Reasons)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockReason {
+    /// 触发 403 静态拦截
+    IpBlocked,
+    /// 触发 Cloudflare 挑战
+    Cloudflare,
+    /// 触发 429 速率限制
+    RateLimit,
+    /// 授权凭据失效
+    TokenExpired,
+    /// 站点相关的自定义阻断
+    Custom(String),
+}
+
+impl std::fmt::Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockReason::IpBlocked => write!(f, "IpBlocked(403)"),
+            BlockReason::Cloudflare => write!(f, "Cloudflare"),
+            BlockReason::RateLimit => write!(f, "RateLimit(429)"),
+            BlockReason::TokenExpired => write!(f, "TokenExpired"),
+            BlockReason::Custom(s) => write!(f, "Custom({})", s),
+        }
+    }
+}
+
+impl From<StatusCode> for BlockReason {
+    fn from(code: StatusCode) -> Self {
+        match code {
+            StatusCode::FORBIDDEN => Self::IpBlocked,
+            StatusCode::TOO_MANY_REQUESTS => Self::RateLimit,
+            _ => Self::Custom(format!("HTTP {}", code)),
+        }
+    }
+}
+
+/// 全局错误定义 (Spider Domain Errors)
 #[derive(Error, Debug)]
 pub enum SpiderError {
     #[error("Network error: {0}")]
@@ -11,10 +54,10 @@ pub enum SpiderError {
     #[error("Browser error: {0}")]
     Browser(String),
 
-    /// 需要刷新客户端并完全重启请求 (例如 CF 绕过或代理切换后)
+    /// 指示需要刷新客户端上下文并重新入队
     #[error("Refresh required: {reason}")]
     RefreshRequired {
-        reason: String,
+        reason: BlockReason,
         new_url: Option<String>,
     },
 
@@ -30,10 +73,9 @@ pub enum SpiderError {
     #[error("Parsing error: {0}")]
     Parse(String),
 
-    /// 软阻断：代表被反爬策略拦截（验证码、Cloudflare等待页等）
-    /// 这种错误是可以恢复的，客户端应尝试调用 recover
+    /// 检测到软阻断，需触发故障恢复逻辑
     #[error("Soft block detected: {0}")]
-    SoftBlock(String),
+    SoftBlock(BlockReason),
 
     #[error("Captcha not supported or failed")]
     CaptchaFailed,
@@ -42,31 +84,21 @@ pub enum SpiderError {
     Custom(String),
 }
 
+/// 全局 Result 别名
 pub type Result<T> = std::result::Result<T, SpiderError>;
 
 impl SpiderError {
-    /// 判断是否为严重的阻断性错误 (需要切 IP 或 启动浏览器)
-    pub fn is_blocking(&self) -> Option<String> {
+    /// 探测并提取错误中的阻断原因
+    /// 
+    /// 支持中间件嵌套错误的分层解包 (Downcasting)。
+    pub fn is_blocking(&self) -> Option<BlockReason> {
         match self {
             SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
             SpiderError::SoftBlock(reason) => Some(reason.clone()),
             SpiderError::Middleware(reqwest_middleware::Error::Middleware(anyhow_err)) => {
-                // 尝试解包 middleware 中的原始错误
-                if let Some(inner) = anyhow_err.downcast_ref::<SpiderError>() {
-                    inner.is_blocking()
-                } else {
-                    None
-                }
+                anyhow_err.downcast_ref::<SpiderError>().and_then(|e| e.is_blocking())
             }
-            // 检查 reqwest 的特定状态码 (虽然通常由 middleware 拦截，但作为兜底)
-            SpiderError::Network(e) => {
-                if let Some(status) = e.status() {
-                    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        return Some(format!("HTTP {}", status));
-                    }
-                }
-                None
-            }
+            SpiderError::Network(e) => e.status().map(BlockReason::from),
             _ => None,
         }
     }

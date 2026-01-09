@@ -1,17 +1,18 @@
-//! Booktoki 内容获取器
+//! Booktoki 内容抓取器 (Content Fetcher)
 //!
-//! 负责获取和解析章节的具体正文内容
+//! 负责章节正文的提取、垃圾信息过滤及多页链接探测。
 
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use url::Url;
 
+use super::SiteSelectors;
 use crate::core::error::{Result, SpiderError};
 use crate::network::client::SiteClient;
-use super::SiteSelectors;
 
-/// Booktoki 内容获取器
+/// 站点特定正文获取器
 pub struct BooktokiFetcher {
+    /// 站点基准 URL
     base: Url,
 }
 
@@ -22,6 +23,7 @@ impl BooktokiFetcher {
 }
 
 impl BooktokiFetcher {
+    /// 执行内容抓取与语义化清理
     pub async fn fetch_content(
         &self,
         url: &str,
@@ -31,13 +33,13 @@ impl BooktokiFetcher {
         let doc = Html::parse_document(&html);
         let s = SiteSelectors::get();
 
-        // 1. 获取正文容器
-        let node = doc.select(&s.novel_content).next().ok_or_else(|| {
-            SpiderError::Parse("Novel content container not found".into())
-        })?;
+        // Container Positioning
+        let node = doc
+            .select(&s.novel_content)
+            .next()
+            .ok_or_else(|| SpiderError::Parse("Novel content container not found".into()))?;
 
-        // 2. 遍历 <p> 标签并过滤 Spam
-        // 优化：避免在过滤阶段进行 String 分配
+        // Spam Filtering
         let content = node
             .select(&s.paragraph)
             .filter_map(|p| {
@@ -45,7 +47,7 @@ impl BooktokiFetcher {
                 let mut all_alphanum = true;
                 let mut has_content = false;
 
-                // Zero-allocation spam check
+                // Zero-allocation Scanning
                 'check: for slice in p.text() {
                     for c in slice.chars() {
                         if !c.is_whitespace() {
@@ -53,13 +55,13 @@ impl BooktokiFetcher {
                             byte_len += c.len_utf8();
                             if !c.is_alphanumeric() {
                                 all_alphanum = false;
-                                break 'check; // 发现非字母数字字符，肯定不是 Spam
+                                break 'check; 
                             }
                         }
                     }
                 }
 
-                // Spam 定义：长度 > 40 且全是字母/数字
+                // Spam 特征：长度超过阈值且全部由字母/数字组成
                 let is_spam = has_content && byte_len > 40 && all_alphanum;
 
                 if is_spam {
@@ -71,7 +73,7 @@ impl BooktokiFetcher {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // 3. 解析下一页链接
+        // 探测续页或子页面链接
         let next_url = doc
             .select(&s.btn_next)
             .next()

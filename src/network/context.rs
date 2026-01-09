@@ -1,6 +1,6 @@
-//! 服务上下文 (ServiceContext)
+//! 全局服务上下文 (Service Context)
 //!
-//! 统一管理所有副作用操作，包含 HTTP 服务、会话、代理、浏览器等。
+//! 核心副作用管理器，集成分布式状态协调、故障恢复流水线及乐观重试机制。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,38 +13,47 @@ use tracing::{debug, info, warn};
 
 use crate::actors::proxy::ProxyMsg;
 use crate::core::config::AppConfig;
-use crate::core::coordinator::{BlockReason, Coordinator};
-use crate::core::error::Result;
+use crate::core::coordinator::Coordinator;
+use crate::core::error::{BlockReason, Result};
 use crate::core::event::EventSender;
 use crate::network::browser::BrowserService;
 use crate::network::service::HttpService;
 use crate::network::session::Session;
 
-/// 服务上下文
+/// 运行时服务上下文
 ///
-/// 封装了所有网络请求和系统恢复相关的操作
+/// 封装网络栈、会话持久化、代理枢纽及浏览器自动化接口，提供高可用的任务执行环境。
 #[derive(Clone)]
 pub struct ServiceContext {
-    /// HTTP 服务
+    /// 核心 HTTP 引擎
     pub http: Arc<HttpService>,
-    /// 会话管理（Cookie、UA 等）
+    /// 同步会话状态
     pub session: Arc<Session>,
-    /// 代理管理 Actor 通信
+    /// 代理调度信道
     pub proxy: Sender<ProxyMsg>,
-    /// 浏览器服务
+    /// 浏览器自动化服务
     pub browser: Arc<BrowserService>,
-    /// 应用配置
+    /// 静态应用配置
     pub config: Arc<AppConfig>,
-    /// 全局状态协调器
+    /// 状态协调器
     pub coordinator: Coordinator,
-    /// 优雅退出令牌
+    /// 生命周期撤回令牌
     pub shutdown: CancellationToken,
-    /// 事件发送器（可选）
+    /// 事件上报总线
     pub events: Option<EventSender>,
 }
 
 impl ServiceContext {
-    /// 创建新的服务上下文
+    /// 单出口节点重试阈值
+    const MAX_RETRIES: u32 = 10;
+    /// 任务全局生存预算 (防止循环依赖导致的任务挂死)
+    const MAX_GLOBAL_RETRIES: u32 = 50;
+    /// 指数退避基准时延
+    const BASE_DELAY: Duration = Duration::from_millis(500);
+    /// 指数退避上限
+    const MAX_DELAY: Duration = Duration::from_secs(5);
+
+    /// 初始化服务上下文
     pub fn new(
         http: Arc<HttpService>,
         session: Arc<Session>,
@@ -64,13 +73,13 @@ impl ServiceContext {
         }
     }
 
-    /// 设置事件发送器
+    /// 注入事件发送器
     pub fn with_events(mut self, events: EventSender) -> Self {
         self.events = Some(events);
         self
     }
 
-    /// 发送事件
+    /// 向总线分发系统事件
     pub fn emit(&self, event: crate::core::event::SpiderEvent) {
         if let Some(ref sender) = self.events {
             sender.emit(event);
@@ -81,99 +90,145 @@ impl ServiceContext {
     // HTTP 请求方法
     // =========================================================================
 
-    /// 构造一个带有基础上下文但没有站点策略的请求构造器
+    /// 构建注入会话特征的请求构造器
     pub fn request_builder(&self, method: Method, url: &str) -> RequestBuilder {
         self.request_builder_with_client(self.http.client(), method, url)
     }
 
-    /// 使用指定的客户端构造请求
-    /// 
-    /// 允许调用方传入特定的客户端实例（例如从 HttpService 获取的副本）
-    pub fn request_builder_with_client(&self, client: reqwest_middleware::ClientWithMiddleware, method: Method, url: &str) -> RequestBuilder {
+    /// 基于特定客户端实例构建请求上下文
+    pub fn request_builder_with_client(
+        &self,
+        client: reqwest_middleware::ClientWithMiddleware,
+        method: Method,
+        url: &str,
+    ) -> RequestBuilder {
         client
             .request(method, url)
             .with_extension(self.session.clone())
             .with_extension(self.clone())
     }
 
-    /// 探测请求，返回状态码和响应体
-    /// 注意：此方法绕过反爬策略
+    /// 执行绕过拦截策略的健康探测
     pub async fn probe(&self, url: &str) -> Result<(u16, String)> {
         self.http.probe(url, self.clone()).await
     }
 
-    /// 乐观执行器 (带自动恢复)
-    /// 
-    /// 封装"试错-等待-重试"逻辑。
-    /// 如果遇到 IP 封禁或 Cloudflare 阻断，会自动触发恢复流程（切 IP / 等待）并无限重试，
-    /// 直到任务成功或遇到不可恢复的错误。
-    pub async fn run_optimistic<F, Fut, T>(&self, desc: impl std::fmt::Display, task: F) -> Result<T>
+    /// 乐观任务执行器 (Optimistic Executor)
+    ///
+    /// 实现“试错-反馈-恢复”闭环逻辑，集成如下特性：
+    /// - **Pre-flight Check**: 状态抢占检查，防止在阻塞期间浪费流量。
+    /// - **Anti-Thundering Herd**: 引入抖动 (Jitter) 缓解恢复瞬间的共振压测。
+    /// - **Auto Recovery**: 检测到特定 BlockReason 时自动触发代理轮换或浏览器挑战。
+    /// - **Equal Jitter Backoff**: 指数退避策略，兼顾重试间隔与负载平滑。
+    pub async fn run_optimistic<F, Fut, T>(
+        &self,
+        desc: impl std::fmt::Display,
+        task: F,
+    ) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        // 局部重试计数 (用于计算当前 IP 的退避时间，切 IP 后会重置)
         let mut attempts = 0;
-        let max_retries = 10;
-        // 指数退避参数
-        let base_delay = Duration::from_millis(500);
-        let max_delay = Duration::from_secs(5);
+        // 全局重试计数 (用于防止无限循环，永远不重置)
+        let mut total_attempts = 0;
 
         loop {
+            // 0. 优雅退出检查
+            if self.shutdown.is_cancelled() {
+                return Err(crate::core::error::SpiderError::Custom("Cancellation: System shutdown".into()));
+            }
+
+            // 1. 起飞前检查 (Pre-flight Check)
+            // 如果系统 Blocked，在此挂起。防止无效请求风暴。
+            // 返回值 waited 指示是否经历了阻塞。
+            let waited = self.wait_if_blocked().await;
+
+            // 2. 唤醒后微抖动 (Anti-Thundering Herd)
+            // 只有当真正发生过等待（即系统从 Blocked 恢复为 Running）时，才应用随机抖动。
+            // 正常运行时的第一次请求不会触发此逻辑。
+            if waited {
+                 tokio::time::sleep(Duration::from_millis(fastrand::u64(0..50))).await;
+            }
+
             attempts += 1;
-            
+            total_attempts += 1;
+
             match task().await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    // 1. 检查是否为阻断性错误 (IP 封禁 / Cloudflare)
-                    if let Some(reason) = e.is_blocking() {
-                        info!("任务遭遇阻断 [{}] ({})，正在执行自动恢复...", desc, reason);
-                        
-                        // 针对性恢复策略
-                        if reason.contains("HTTP 403") || reason.contains("HTTP 429") {
-                            self.rotate_proxy().await;
-                        }
-                        
-                        self.wait_if_blocked().await;
-                        attempts = 0; // 环境已重置，重置尝试计数
-                        continue;
-                    }
-
-                    // 2. 达到最大重试次数，放弃
-                    if attempts >= max_retries {
+                    // 全局熔断检查
+                    if total_attempts >= Self::MAX_GLOBAL_RETRIES {
+                        warn!("Task [{}] exceeded global budget ({}), aborting.", desc, Self::MAX_GLOBAL_RETRIES);
                         return Err(e);
                     }
 
-                    // 3. 计算指数退避时间 (Exponential Backoff with Jitter)
-                    // delay = min(max_delay, base * 2^(attempts-1))
-                    let backoff = base_delay.checked_mul(1 << (attempts - 1)).unwrap_or(max_delay).min(max_delay);
-                    // 添加 10% 的随机抖动，防止共振 (Simple pseudo-random using system time)
-                    let nanos = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos();
-                    let random_factor = (nanos % 100) as f32 / 1000.0; // 0.000 to 0.099
-                    let jitter = backoff.mul_f32(random_factor); 
-                    let wait_time = backoff + jitter;
+                    // 3. 阻断性错误处理
+                    if let Some(reason) = e.is_blocking() {
+                        info!("Task blocked [{}] ({}), initiating recovery...", desc, reason);
 
-                    self.wait_if_blocked().await;
+                        match reason {
+                            BlockReason::IpBlocked | BlockReason::RateLimit => {
+                                self.rotate_proxy().await;
+                            }
+                            _ => {}
+                        }
 
+                        // 环境重置后，清空局部计数器，以便新 IP 从短时间等待开始试探
+                        attempts = 0;
+                        continue;
+                    }
+
+                    // 4. 局部最大重试检查
+                    if attempts >= Self::MAX_RETRIES {
+                        return Err(e);
+                    }
+
+                    // 5. 指数退避 (可中断)
+                    let wait_time = Self::calculate_backoff(attempts);
+                    
                     warn!(
-                        "任务失败 [{}] (第 {}/{} 次): {}。将在 {:?} 后重试...",
-                        desc, attempts, max_retries, e, wait_time
+                        "Task failed [{}] ({}/{} | total {}): {}. Retrying in {:?}...",
+                        desc, attempts, Self::MAX_RETRIES, total_attempts, e, wait_time
                     );
-                    tokio::time::sleep(wait_time).await;
+
+                    // 使用 select! 确保在休眠期间也能响应退出信号
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait_time) => {},
+                        _ = self.shutdown.cancelled() => {
+                            return Err(crate::core::error::SpiderError::Custom("Cancellation: Interrupted".into()));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// 计算退避时间 (Equal Jitter 策略)
+    fn calculate_backoff(attempts: u32) -> Duration {
+        // 防止溢出，限制指数上限
+        let exp = (attempts.saturating_sub(1)).min(30);
+        let ceil = Self::BASE_DELAY
+            .checked_mul(1 << exp)
+            .unwrap_or(Self::MAX_DELAY)
+            .min(Self::MAX_DELAY);
+        
+        // Equal Jitter implementation
+        let half = ceil / 2;
+        // fastrand::u64(0..v) 生成 [0, v)
+        let jitter_nanos = fastrand::u64(0..half.as_nanos() as u64);
+        
+        half + Duration::from_nanos(jitter_nanos)
     }
 
     // =========================================================================
     // 恢复操作
     // =========================================================================
 
-    /// 切换代理
-    ///
-    /// 通过协调器确保只有一个任务执行切换
+    /// 调度代理节点轮换
+    /// 
+    /// 采用协调器抢占模式，确保并发环境下仅执行一次切换动作。
     pub async fn rotate_proxy(&self) {
         // 尝试获取修复权限。如果已有其他人（或当前线程自己持有了不同原因的锁）正在修复，
         // 且状态不是 Running，try_acquire_fix 内部会根据情况等待。
@@ -186,7 +241,7 @@ impl ServiceContext {
         }
     }
 
-    /// 实际执行代理切换
+    /// 物理执行代理切换及环境重置
     async fn do_rotate_proxy(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
@@ -197,60 +252,61 @@ impl ServiceContext {
             // 设定一个合理的超时，防止 ProxyActor 挂死导致全线崩溃
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(_) => {
-                    debug!("代理节点已完成物理切换");
+                    debug!("Proxy rotation confirmed by actor");
                     // 切换 IP 后，必须清除旧会话 (Cookie/UA)，确保身份彻底刷新
                     self.session.clear();
-                    
+
                     // 重置 HTTP 客户端 (清除旧的连接池)
                     // 否则 Keep-Alive 的连接可能会连到旧的 IP (取决于 sing-box 行为)
                     if let Err(e) = self.http.recreate_client() {
-                        warn!("重置 HTTP 客户端失败: {}", e);
+                        warn!("Failed to recreate client: {}", e);
                     }
                 }
-                Err(_) => warn!("代理切换响应超时"),
+                Err(_) => warn!("Proxy rotation timeout"),
             }
         }
     }
 
-    /// 强制切换代理（不经过协调器）
+    /// 强行触发出口节点变更
     pub async fn force_rotate_proxy(&self) {
         self.do_rotate_proxy().await;
     }
 
-
-
-    /// 更新 Cookie
+    /// 原子化更新会话凭据
     pub fn update_cookies(&self, cookies: &str) {
         self.session.set_cookie(cookies.to_string());
-        debug!("Cookie 已更新");
+        debug!("Session credentials updated");
     }
 
-    /// 绕过 Cloudflare
+    /// 激活浏览器自动化绕过 Cloudflare 挑战
     pub async fn bypass_cloudflare(&self, url: &str) -> Result<()> {
         if let Some(_guard) = self
             .coordinator
             .try_acquire_fix(BlockReason::Cloudflare)
             .await
         {
-            info!("正在通过浏览器绕过 Cloudflare...");
+            info!("Initiating browser-based Cloudflare bypass...");
             self.browser.bypass(url, self).await?;
         }
 
         Ok(())
     }
 
-    /// 等待系统恢复运行
-    pub async fn wait_if_blocked(&self) {
+    /// 检查并同步等待系统恢复至运行态
+    pub async fn wait_if_blocked(&self) -> bool {
         if !self.coordinator.is_running() {
-            debug!("系统阻塞中，等待恢复...");
+            debug!("System blocked, awaiting recovery...");
             self.coordinator.wait_until_running().await;
+            true
+        } else {
+            false
         }
     }
 
-    /// 等待系统恢复运行（带超时）
+    /// 检查并等待系统恢复 (带超时)
     pub async fn wait_if_blocked_timeout(&self, timeout: Duration) -> bool {
         if !self.coordinator.is_running() {
-            debug!("系统阻塞中，等待恢复（超时: {:?}）...", timeout);
+            debug!("System blocked, awaiting recovery (timeout: {:?})...", timeout);
             self.coordinator.wait_until_running_timeout(timeout).await
         } else {
             true

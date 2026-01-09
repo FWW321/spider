@@ -1,6 +1,6 @@
-//! Booktoki 索引器
+//! Booktoki 资源索引器 (Resource Indexer)
 //!
-//! 负责获取书籍元数据和章节列表
+//! 负责站点元数据的抽取与章节层级结构的递归发现。
 
 use async_trait::async_trait;
 use scraper::{ElementRef, Html};
@@ -14,24 +14,24 @@ use crate::utils::to_absolute_url;
 
 use super::SiteSelectors;
 
-/// Booktoki 索引器
+/// 站点特定索引器
 pub struct BooktokiIndexer {
+    /// 站点基准 URL (用于相对路径规范化)
     base: Url,
 }
 
 impl BooktokiIndexer {
-    /// 创建新的索引器
     pub fn new(base: Url) -> Self {
         Self { base }
     }
 
-    /// 规范化 URL
+    /// 执行相对路径至绝对 URL 的规范化 (URI Normalization)
     #[inline]
     fn normalize(&self, path: &str) -> String {
         to_absolute_url(&self.base, path)
     }
 
-    /// 提取图标后的文本
+    /// 基于 CSS 选择器提取紧邻 Icon 节点的文本内容
     fn extract_icon_text(
         &self,
         parent: &ElementRef,
@@ -46,14 +46,13 @@ impl BooktokiIndexer {
             .filter(|s| !s.is_empty())
     }
 
-    /// 解析元数据
+    /// 执行元数据 HTML 静态分析 (Metadata Scoping)
     fn parse_metadata_html(&self, html: &str) -> Result<(Metadata, Option<TaskArgs>)> {
         let doc = Html::parse_document(html);
         let s = SiteSelectors::get();
 
         let detail = doc.select(&s.detail_desc).next().ok_or_else(|| {
-            // 如果在重试后仍然找不到，说明是解析错误或死链
-            SpiderError::Parse("Detail element not found (Structure changed or invalid ID)".into())
+            SpiderError::Parse("Target resource not found: Structural mismatch or invalid ID".into())
         })?;
 
         let mut contents = detail.select(&s.view_content);
@@ -101,7 +100,7 @@ impl BooktokiIndexer {
         ))
     }
 
-    /// 解析章节列表
+    /// 执行章节列表分步解析与分页探测 (Pagination Discovery)
     fn parse_chapters_html(&self, html: &str) -> Result<(Vec<BookItem>, Option<String>)> {
         if html.is_empty() {
             return Ok((vec![], None));
@@ -146,6 +145,7 @@ impl BooktokiIndexer {
             })
             .collect();
 
+        // 探测下一页 URL 节点
         let next_url = doc
             .select(&s.pagination_next)
             .next()
@@ -156,32 +156,33 @@ impl BooktokiIndexer {
         Ok((chapters, next_url))
     }
 
-    /// 构建 URL
+    /// 根据路由变体构建资源定位符
     fn build_url(&self, kind: &str, args: &TaskArgs) -> Result<String> {
         match kind {
             "metadata" | "chapters" => {
                 let id = args
                     .get("id")
-                    .ok_or_else(|| SpiderError::Parse("Missing id".into()))?;
+                    .ok_or_else(|| SpiderError::Parse("Missing dynamic parameter: id".into()))?;
                 Ok(self.normalize(&format!("/novel/{}", id)))
             }
-            _ => Err(SpiderError::Parse(format!("Unknown kind: {}", kind))),
+            _ => Err(SpiderError::Parse(format!("Unknown routing kind: {}", kind))),
         }
     }
 }
 
 impl BooktokiIndexer {
+    /// 执行元数据抓取与解析任务
     pub async fn fetch_metadata(
         &self,
         args: &TaskArgs,
         client: &SiteClient,
     ) -> Result<(Metadata, Option<TaskArgs>)> {
         let url = self.build_url("metadata", args)?;
-        // 使用 Client，自动处理重试
         let html = client.get_text(&url).await?;
         self.parse_metadata_html(&html)
     }
 
+    /// 初始化章节列表获取任务
     pub async fn fetch_chapters(
         &self,
         args: &TaskArgs,
@@ -191,6 +192,7 @@ impl BooktokiIndexer {
         self.fetch_chapters_by_url(&url, client).await
     }
 
+    /// 基于特定 URL 执行增量章节抓取
     pub async fn fetch_chapters_by_url(
         &self,
         url: &str,

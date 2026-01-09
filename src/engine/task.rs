@@ -1,4 +1,6 @@
-//! 任务单元定义
+//! 任务原子单元 (Atomic Task Units)
+//!
+//! 定义抓取流程中可独立执行的最小操作单元，并处理其生命周期与状态转换。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,27 +15,30 @@ use crate::utils::{file_exists, generate_filename, save_file};
 
 use super::context::RuntimeContext;
 
-/// 任务执行结果
+/// 任务执行反馈 (Execution Result)
 pub enum TaskResult {
-    /// 任务完成，无后续动作
+    /// 任务正常终止
     Completed,
-    /// 任务完成，产生新任务
+    /// 任务执行成功，并生成后续衍生任务 (例如从章节 HTML 提取出图片下载任务)
     Spawn(Vec<Task>),
-    /// 任务被跳过 (如文件已存在)
+    /// 任务被静默跳过 (例如命中物理文件缓存)
     Skipped,
 }
 
-/// 具体的下载任务
+/// 可并发执行的下载任务变体
 #[derive(Debug, Clone)]
 pub enum Task {
+    /// 书籍封面下载
     Cover {
         url: String,
         path: PathBuf,
     },
+    /// 章节正文抓取
     Chapter {
         chapter: Chapter,
         path: PathBuf,
     },
+    /// 媒体资源下载
     Image {
         url: String,
         path: PathBuf,
@@ -44,15 +49,17 @@ pub enum Task {
 impl std::fmt::Display for Task {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Task::Cover { url, .. } => write!(f, "下载封面 ({})", url),
-            Task::Chapter { chapter, .. } => write!(f, "下载章节 {} - {}", chapter.index, chapter.title),
-            Task::Image { source, url, .. } => write!(f, "下载图片 [{}] ({})", source, url),
+            Task::Cover { url, .. } => write!(f, "Cover Download ({})", url),
+            Task::Chapter { chapter, .. } => {
+                write!(f, "Chapter Fetch {} - {}", chapter.index, chapter.title)
+            }
+            Task::Image { source, url, .. } => write!(f, "Image Download [{}] ({})", source, url),
         }
     }
 }
 
 impl Task {
-    /// 执行任务
+    /// 驱动任务执行，并应用并发节流 (Concurrency Throttling)
     pub async fn run(self, ctx: Arc<RuntimeContext>) -> Result<TaskResult> {
         let _permit = ctx
             .semaphore
@@ -67,18 +74,14 @@ impl Task {
         }
     }
 
-    async fn handle_cover(
-        url: String,
-        path: PathBuf,
-        ctx: &RuntimeContext,
-    ) -> Result<TaskResult> {
+    async fn handle_cover(url: String, path: PathBuf, ctx: &RuntimeContext) -> Result<TaskResult> {
         if file_exists(&path).await {
             return Ok(TaskResult::Skipped);
         }
 
         let bytes = ctx
             .core
-            .run_optimistic("下载封面", || {
+            .run_optimistic("Cover Download", || {
                 let url = url.clone();
                 let site = ctx.site.clone();
                 async move { site.client().get_bytes(&url).await }
@@ -88,7 +91,7 @@ impl Task {
         save_file(&path, &bytes).await?;
 
         ctx.emit(SpiderEvent::CoverDownloaded);
-        info!("封面下载完成");
+        info!("Cover artifact saved");
 
         Ok(TaskResult::Completed)
     }
@@ -105,7 +108,7 @@ impl Task {
 
         match ctx
             .core
-            .run_optimistic(format!("下载图片: {}", url), || {
+            .run_optimistic(format!("Image Download: {}", url), || {
                 let url = url.clone();
                 let site = ctx.site.clone();
                 async move { site.client().get_bytes(&url).await }
@@ -114,10 +117,10 @@ impl Task {
         {
             Ok(bytes) => {
                 save_file(&path, &bytes).await?;
-                info!("图片已保存 [{}] : {}", source, url);
+                info!("Image saved [{}] : {}", source, url);
             }
             Err(e) => {
-                warn!("图片下载失败 [{}]: {}", source, e);
+                warn!("Image download failed [{}]: {}", source, e);
             }
         }
         Ok(TaskResult::Completed)
@@ -128,13 +131,12 @@ impl Task {
         path: PathBuf,
         ctx: &RuntimeContext,
     ) -> Result<TaskResult> {
-        // 检查缓存
+        // 物理缓存命检 (Cache Hit Check)
         if let Ok(html) = tokio::fs::read_to_string(&path).await
             && !html.is_empty()
         {
-            debug!("跳过已存在章节: {}", chapter.title);
+            debug!("Cache hit for chapter: {}", chapter.title);
 
-            // 更新进度
             let completed = ctx.completed_chapters.fetch_add(1, Ordering::SeqCst) + 1;
             ctx.emit(SpiderEvent::ChapterProgress {
                 current: completed,
@@ -142,15 +144,18 @@ impl Task {
                 title: chapter.title.clone(),
             });
 
-            // 即便是缓存的 HTML，也需要解析图片链接以确保图片被下载
+            // 仍需重构图片任务以确保资源清单完整性
             let (_, images) = ctx.site.process_images(&html);
-            return Ok(TaskResult::Spawn(Self::create_image_tasks(images, &ctx.images_dir, &chapter.title)));
+            return Ok(TaskResult::Spawn(Self::create_image_tasks(
+                images,
+                &ctx.images_dir,
+                &chapter.title,
+            )));
         }
 
-        // 获取内容
         let raw_html = ctx
             .core
-            .run_optimistic(format!("下载章节: {}", chapter.title), || {
+            .run_optimistic(format!("Chapter Fetch: {}", chapter.title), || {
                 let site_ctx = ctx.make_site_context();
                 let item = BookItem::Chapter(chapter.clone());
                 let site = ctx.site.clone();
@@ -158,12 +163,11 @@ impl Task {
             })
             .await?;
 
-        // 处理内容 (图片提取 + 链接替换)
+        // 资源重写与图像清单提取 (Resource Manifest Extraction)
         let (processed_content, image_urls) = ctx.site.process_images(&raw_html);
 
         save_file(&path, processed_content.as_bytes()).await?;
 
-        // 更新进度
         let completed = ctx.completed_chapters.fetch_add(1, Ordering::SeqCst) + 1;
         ctx.emit(SpiderEvent::ChapterProgress {
             current: completed,
@@ -176,13 +180,18 @@ impl Task {
         });
 
         info!(
-            "[/{}/{}] {}",
+            "Progress [/{}/{}] {}",
             chapter.index, ctx.total_chapters, chapter.title
         );
 
-        Ok(TaskResult::Spawn(Self::create_image_tasks(image_urls, &ctx.images_dir, &chapter.title)))
+        Ok(TaskResult::Spawn(Self::create_image_tasks(
+            image_urls,
+            &ctx.images_dir,
+            &chapter.title,
+        )))
     }
 
+    /// 根据 URL 列表构建衍生下载任务
     fn create_image_tasks(images: Vec<String>, images_dir: &Path, source: &str) -> Vec<Task> {
         images
             .into_iter()
@@ -191,7 +200,7 @@ impl Task {
                 Task::Image {
                     url,
                     path: images_dir.join(filename),
-                    source: format!("章节: {}", source),
+                    source: format!("Chapter: {}", source),
                 }
             })
             .collect()

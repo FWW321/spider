@@ -1,9 +1,14 @@
+//! 领域模型定义 (Domain Models)
+//!
+//! 抽象采集任务中的实体对象，包括元数据、资源分层及物理存储映射。
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::utils::generate_filename;
 
+/// 书籍元数据 (Metadata)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub title: String,
@@ -26,12 +31,13 @@ fn default_language() -> String {
 }
 
 impl Metadata {
+    /// 封面文件名序列化
     pub fn cover_filename(&self) -> Option<String> {
         self.cover_url.as_ref().map(|url| generate_filename(url))
     }
 }
 
-/// 章节信息
+/// 章节实体 (Chapter Entity)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chapter {
     pub index: u32,
@@ -41,12 +47,13 @@ pub struct Chapter {
 }
 
 impl Chapter {
+    /// 物理文件命名规则
     pub fn filename(&self) -> String {
         format!("chap_{}", self.id)
     }
 }
 
-/// 卷信息
+/// 卷/合集实体 (Volume Entity)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Volume {
     pub index: u32,
@@ -62,6 +69,7 @@ impl Volume {
         self.cover_url.as_ref().map(|url| generate_filename(url))
     }
 
+    /// 生成卷索引页 HTML 片段
     pub fn content(&self) -> String {
         let mut content = String::new();
 
@@ -82,6 +90,7 @@ impl Volume {
     }
 }
 
+/// 资源项枚举 (Resource Item Variant)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BookItem {
@@ -97,6 +106,7 @@ impl BookItem {
         }
     }
 
+    /// 将项平展为章节迭代器
     pub fn into_chapters(self) -> impl Iterator<Item = Chapter> {
         match self {
             BookItem::Chapter(c) => vec![c].into_iter(),
@@ -105,6 +115,7 @@ impl BookItem {
     }
 }
 
+/// 书籍根实体 (Aggregate Root)
 #[derive(Debug, Clone)]
 pub struct Book {
     pub site_id: String,
@@ -131,6 +142,7 @@ impl Book {
         }
     }
 
+    /// 跨站点全局唯一标识
     pub fn unique_id(&self) -> String {
         format!("{}_{}", self.site_id, self.id)
     }
@@ -143,6 +155,7 @@ impl Book {
         self.items.iter().cloned().flat_map(BookItem::into_chapters)
     }
 
+    /// 获取展平后的总章节数
     pub fn chapter_count(&self) -> usize {
         self.items
             .iter()
@@ -153,6 +166,7 @@ impl Book {
             .sum()
     }
 
+    /// 获取工作根目录并确保其物理存在
     pub async fn work_dir(&self) -> PathBuf {
         let dir = self
             .base_dir
@@ -163,6 +177,7 @@ impl Book {
         dir
     }
 
+    /// 获取文本存储目录
     pub async fn text_dir(&self) -> PathBuf {
         let work_dir = self.work_dir().await;
         let dir = work_dir.join("Text");
@@ -170,6 +185,7 @@ impl Book {
         dir
     }
 
+    /// 获取封面存储目录
     pub async fn cover_dir(&self) -> PathBuf {
         let work_dir = self.work_dir().await;
         let dir = work_dir.join("Cover");
@@ -177,6 +193,7 @@ impl Book {
         dir
     }
 
+    /// 获取通用资源存储目录
     pub async fn images_dir(&self) -> PathBuf {
         let work_dir = self.work_dir().await;
         let dir = work_dir.join("Images");

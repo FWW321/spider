@@ -1,12 +1,12 @@
-//! Booktoki 选择器
+//! Booktoki 语义选择器 (Semantic Selectors)
 //!
-//! 预编译的 CSS 选择器
+//! 预编译的 CSS 选择器集，用于高效提取 HTML 结构数据。
 
 use std::sync::OnceLock;
 
 use scraper::Selector;
 
-/// 站点选择器集合
+/// 站点特定选择器映射
 pub struct SiteSelectors {
     pub detail_desc: Selector,
     pub view_content: Selector,
@@ -28,7 +28,7 @@ pub struct SiteSelectors {
 static SELECTORS: OnceLock<SiteSelectors> = OnceLock::new();
 
 impl SiteSelectors {
-    /// 获取全局选择器实例
+    /// 获取全局单例选择器实例 (Lazy Compilation)
     pub fn get() -> &'static SiteSelectors {
         SELECTORS.get_or_init(|| SiteSelectors {
             detail_desc: Selector::parse("div[itemprop='description']").unwrap(),

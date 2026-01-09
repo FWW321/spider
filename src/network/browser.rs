@@ -1,10 +1,10 @@
-//! 浏览器服务
+//! 浏览器自动化服务 (Browser Automation Service)
 //!
-//! 封装浏览器相关操作，包括 Cloudflare 绕过等
+//! 封装基于 CDP 的浏览器操作，主要用于解决 Cloudflare 挑战及指纹特征提取。
 
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
-use std::path::Path;
 
 use chromiumoxide::{
     Page,
@@ -21,12 +21,14 @@ use tokio::{
 use tracing::{debug, info};
 
 use crate::core::config::AppConfig;
-use crate::core::error::{Result, SpiderError};
+use crate::core::error::{BlockReason, Result, SpiderError};
 
+/// 隐身补丁脚本
 static STEALTH_JS: &str = include_str!("../../stealth.min.js");
+/// 指纹缓存
 static UA_CACHE: OnceCell<String> = OnceCell::const_new();
 
-/// 默认的浏览器请求头
+/// 浏览器端标准请求头集
 static DEFAULT_BROWSER_HEADERS: OnceLock<HeaderMap> = OnceLock::new();
 
 fn get_default_headers() -> &'static HeaderMap {
@@ -42,25 +44,26 @@ fn get_default_headers() -> &'static HeaderMap {
     })
 }
 
-/// 浏览器会话
-/// 采用显式的所有权管理，确保关闭逻辑的确定性
+/// 浏览器会话容器 (Browser Session)
+/// 
+/// 负责管理 Chromium 进程的生命周期及 CDP 事件循环。
 pub struct BrowserSession {
+    /// 浏览器实例
     browser: Option<Browser>,
+    /// 事件循环句柄
     handler: Option<JoinHandle<()>>,
 }
 
 impl BrowserSession {
-    /// 启动浏览器会话
+    /// 启动浏览器实例并初始化事件循环
     pub async fn launch(config: &AppConfig) -> Result<Self> {
         let ua = UA_CACHE.get_or_init(Self::probe_native_ua).await;
-        // 将配置构建委托给私有辅助函数
         let browser_config = build_browser_config(config, ua)?;
 
         let (browser, mut handler) = Browser::launch(browser_config)
             .await
             .map_err(|e| SpiderError::Browser(e.to_string()))?;
 
-        // 启动事件循环
         let handle = tokio::spawn(async move {
             while let Some(h) = handler.next().await {
                 if h.is_err() {
@@ -75,9 +78,12 @@ impl BrowserSession {
         })
     }
 
-    /// 创建新页面
+    /// 创建预置 Stealth 脚本的新页面
     pub async fn new_page(&self) -> Result<Page> {
-        let browser = self.browser.as_ref().ok_or_else(|| SpiderError::Browser("Browser already closed".into()))?;
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| SpiderError::Browser("Browser session already closed".into()))?;
         let page = browser
             .new_page("about:blank")
             .await
@@ -89,13 +95,13 @@ impl BrowserSession {
             ))
             .await
         {
-            debug!("Stealth injection warning: {}", e);
+            debug!("Stealth script injection failed: {}", e);
         }
 
         Ok(page)
     }
 
-    /// 优雅关闭浏览器，并等待事件循环结束
+    /// 优雅关闭浏览器会话并回收资源
     pub async fn close(&mut self) -> Result<()> {
         let browser = self.browser.take();
         let handler = self.handler.take();
@@ -109,10 +115,10 @@ impl BrowserSession {
         Ok(())
     }
 
+    /// 原生 User-Agent 探测 (Fingerprint Probing)
     async fn probe_native_ua() -> String {
-        debug!("正在探测系统原生 User-Agent...");
+        debug!("Probing native system User-Agent...");
 
-        // 简化的探测配置
         let config = match BrowserConfig::builder()
             .arg("--headless=new")
             .arg("--no-sandbox")
@@ -135,7 +141,6 @@ impl BrowserSession {
             }
         });
 
-        // 执行探测逻辑
         let result = async {
             let page = browser.new_page("about:blank").await?;
             let ua: String = page.evaluate("navigator.userAgent").await?.into_value()?;
@@ -145,7 +150,6 @@ impl BrowserSession {
 
         let _ = browser.close().await;
         let _ = handle.await;
-        // 允许 OS 回收资源
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(browser);
 
@@ -154,7 +158,7 @@ impl BrowserSession {
                 let clean_ua = ua
                     .replace("HeadlessChrome", "Chrome")
                     .replace("Headless", "");
-                debug!("UA 探测成功: {}", clean_ua);
+                debug!("Native UA probed: {}", clean_ua);
                 clean_ua
             }
             Err(_) => Self::fallback_ua(),
@@ -166,7 +170,7 @@ impl BrowserSession {
     }
 }
 
-/// 构建浏览器配置
+/// 构建 Chromium 启动参数集
 fn build_browser_config(config: &AppConfig, ua: &str) -> Result<BrowserConfig> {
     let mut builder = BrowserConfig::builder()
         .arg("--disable-blink-features=AutomationControlled")
@@ -207,13 +211,11 @@ fn build_browser_config(config: &AppConfig, ua: &str) -> Result<BrowserConfig> {
     builder.build().map_err(SpiderError::Browser)
 }
 
-// 在 Drop 时尝试最后一次保护，但不报 WARN
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         if self.browser.is_some() {
             let mut browser = self.browser.take().unwrap();
             let handler = self.handler.take();
-            // 在后台清理
             tokio::spawn(async move {
                 let _ = browser.close().await;
                 if let Some(h) = handler {
@@ -224,10 +226,7 @@ impl Drop for BrowserSession {
     }
 }
 
-// =============================================================================
-// BrowserService
-// =============================================================================
-
+/// 自动化挑战解决服务 (Challenge Resolution Service)
 pub struct BrowserService {
     config: std::sync::Arc<AppConfig>,
 }
@@ -237,6 +236,9 @@ impl BrowserService {
         Self { config }
     }
 
+    /// 执行挑战绕过流程
+    /// 
+    /// 集成重试机制、代理轮换及状态上报。
     pub async fn bypass(
         &self,
         url: &str,
@@ -246,16 +248,15 @@ impl BrowserService {
         let max_attempts = self.config.spider.retry_count;
 
         for attempt in 1..=max_attempts {
-            info!("正在尝试绕过验证 ({}/{})...", attempt, max_attempts);
+            info!("Bypassing verification ({}/{})...", attempt, max_attempts);
 
             match self.try_single_attempt(url, ctx).await {
                 Ok(_) => {
-                    info!("验证通过");
+                    info!("Verification passed");
                     return Ok(());
                 }
                 Err(e) => {
-                    // 使用 info 级别，因为切 IP 是常规操作
-                    info!("尝试失败，准备切换代理: {}", e);
+                    info!("Verification attempt failed, rotating proxy: {}", e);
                     last_error = Some(e);
                     ctx.force_rotate_proxy().await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -264,28 +265,27 @@ impl BrowserService {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            SpiderError::Browser(format!("验证在 {} 次尝试后失败", max_attempts))
+            SpiderError::Browser(format!("Bypass failed after {} attempts", max_attempts))
         }))
     }
 
+    /// 执行单次绕过尝试
     async fn try_single_attempt(
         &self,
         url: &str,
         ctx: &crate::network::context::ServiceContext,
     ) -> Result<()> {
         let mut session = BrowserSession::launch(&self.config).await?;
-        
-        // 使用 scope 确保即使 execute_page_logic 出错也能走到 session.close()
         let result = self.execute_page_logic(&session, url, ctx).await;
 
-        // 显式关闭并等待资源释放
         if let Err(e) = session.close().await {
-            debug!("关闭浏览器时发生非致命错误: {}", e);
+            debug!("Non-fatal error during browser closure: {}", e);
         }
 
         result
     }
 
+    /// 页面交互逻辑
     async fn execute_page_logic(
         &self,
         session: &BrowserSession,
@@ -304,15 +304,14 @@ impl BrowserService {
         Ok(())
     }
 
-    /// 等待挑战 (Cloudflare/验证码)
+    /// 状态监测与挑战确认 (Challenge Detection)
     async fn wait_for_challenge(&self, page: &Page) -> Result<()> {
         timeout(Duration::from_secs(25), async {
             let mut ticker = interval(Duration::from_secs(1));
-            
+
             loop {
                 ticker.tick().await;
 
-                // 1. 获取标题，如果获取失败（如页面崩溃），视为空并继续等待
                 let title = page
                     .get_title()
                     .await
@@ -320,39 +319,41 @@ impl BrowserService {
                     .unwrap_or_default()
                     .to_lowercase();
 
-                // 2. 检查致命封锁 (Guard Clause)
+                // 致命拦截判断 (Fatal Block)
                 if title.contains("403 forbidden") || title.contains("access denied") {
-                    return Err(SpiderError::SoftBlock("ip_blocked_in_browser".into()));
+                    return Err(SpiderError::SoftBlock(BlockReason::IpBlocked));
                 }
 
-                // 3. 检查是否还在等待页
-                if title.is_empty() || title.contains("just a moment") || title.contains("cloudflare") {
-                    debug!("正在等待 Cloudflare 跳转 (当前标题: {})...", title);
+                // 挑战页检测
+                if title.is_empty()
+                    || title.contains("just a moment")
+                    || title.contains("cloudflare")
+                {
+                    debug!("Waiting for Cloudflare redirect (Title: {})...", title);
                     continue;
                 }
 
-                // 4. 标题正常，检查关键 Cookie
+                // 持久凭据校验 (Credential Validation)
                 let cookies = page.get_cookies().await.unwrap_or_default();
                 if cookies.iter().any(|c| c.name == "cf_clearance") {
-                    debug!("页面验证通过且获取到 cf_clearance (标题: {})", title);
+                    debug!("Challenge solved, cf_clearance acquired (Title: {})", title);
                     return Ok(());
                 }
 
-                // 5. 标题虽然正常，但没拿到 Cookie，继续等待
-                debug!("页面已跳转但缺少 cf_clearance，继续等待...");
+                debug!("Page transitioned but cf_clearance missing, still waiting...");
             }
         })
         .await
-        .map_err(|_| SpiderError::Browser("Cloudflare 绕过超时".into()))?
+        .map_err(|_| SpiderError::Browser("Challenge bypass timeout".into()))?
     }
 
-    /// 提取数据并保存到 Session
+    /// 数据提取与会话状态同步
     async fn extract_and_save_data(
         &self,
         page: &Page,
         ctx: &crate::network::context::ServiceContext,
     ) -> Result<()> {
-        // 1. 提取并保存 Cookie
+        // 同步 Cookie 凭据
         let cookies = page
             .get_cookies()
             .await
@@ -367,7 +368,7 @@ impl BrowserService {
             ctx.session.set_cookie(cookie_str);
         }
 
-        // 2. 提取并保存 UA (使用 if let 简化)
+        // 同步 User-Agent
         if let Ok(ua_val) = page.evaluate("navigator.userAgent").await {
             if let Ok(ua) = ua_val.into_value::<String>() {
                 if !ua.is_empty() {
@@ -376,9 +377,9 @@ impl BrowserService {
             }
         }
 
-        // 3. 设置静态 Headers (零分配)，reqwest::Client 的 Headers 克隆开销很小 (Arc 内部共享)
+        // 注入默认浏览器上下文请求头
         ctx.session.set_headers(get_default_headers().clone());
-        
+
         Ok(())
     }
 }

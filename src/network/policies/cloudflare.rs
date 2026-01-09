@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Response;
 use tracing::info;
 
-use crate::core::error::{Result, SpiderError};
+use crate::core::error::{BlockReason, Result, SpiderError};
 use crate::interfaces::policy::{NetworkPolicy, PolicyResult};
 use crate::network::context::ServiceContext;
 use crate::network::{ResponseExt, ResponseMetadata};
@@ -40,7 +40,7 @@ impl NetworkPolicy for CloudflarePolicy {
             ctx.bypass_cloudflare(&url_str).await?;
             return Ok(PolicyResult::Retry {
                 is_force: true,
-                reason: "cloudflare_bypassed".into()
+                reason: BlockReason::Cloudflare,
             });
         }
 

@@ -89,7 +89,10 @@ impl Site for Booktoki {
     }
 
     async fn fetch_chapter_list(&self, ctx: &Context) -> Result<Vec<BookItem>> {
-        let (mut items, mut next) = self.indexer.fetch_chapters(&ctx.args, self.client()).await?;
+        let (mut items, mut next) = self
+            .indexer
+            .fetch_chapters(&ctx.args, self.client())
+            .await?;
 
         // 处理分页
         while let Some(url) = next {

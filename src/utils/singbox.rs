@@ -1,3 +1,7 @@
+//! sing-box 进程管理器 (Process Controller)
+//!
+//! 负责代理核心进程的生命周期维护、动态配置生成及外部 API 指令编排。
+
 use std::env::consts::EXE_SUFFIX;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -10,16 +14,24 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
+/// sing-box 基础设施控制器
 pub struct SingBoxController {
+    /// 二进制文件路径
     executable: PathBuf,
+    /// 运行时配置文件路径
     config_path: PathBuf,
+    /// 后端控制接口基准 URL
     api_base: Url,
+    /// 接口认证凭据
     api_secret: String,
+    /// 活跃子进程句柄
     child: Mutex<Option<Child>>,
+    /// 用于发送 API 指令的 HTTP 客户端
     client: Client,
 }
 
 impl SingBoxController {
+    /// 初始化控制器实例
     pub fn new(bin_dir: &Path, cache_dir: &Path, api_port: u16, api_secret: &str) -> Result<Self> {
         let executable = bin_dir.join(format!("sing-box{}", EXE_SUFFIX));
         let config_path = cache_dir.join("config.json");
@@ -28,7 +40,7 @@ impl SingBoxController {
             .context("Invalid API URL construction")?;
 
         let client = Client::builder()
-            .no_proxy()
+            .no_proxy() // 核心 API 请求必须绕过系统代理
             .timeout(Duration::from_secs(5))
             .build()
             .context("Failed to build HTTP client")?;
@@ -43,6 +55,7 @@ impl SingBoxController {
         })
     }
 
+    /// 持久化核心配置文件
     pub async fn write_config(&self, config_content: &str) -> Result<()> {
         if let Some(parent) = self.config_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -55,57 +68,62 @@ impl SingBoxController {
         Ok(())
     }
 
+    /// 启动代理核心进程
     pub async fn start(&self) -> Result<()> {
         let mut child_guard = self.child.lock().await;
         if child_guard.is_some() {
-            debug!("sing-box 已经在运行中");
+            debug!("Instance already active");
             return Ok(());
         }
 
         if !self.executable.exists() {
             return Err(anyhow!(
-                "未找到 sing-box 执行文件: {}",
+                "Artifact missing: {}",
                 self.executable.display()
             ));
         }
 
         let log_path = self.config_path.with_file_name("sing-box.log");
-        
+
         let log_file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
             .await
-            .context("无法打开 sing-box 日志文件")?;
+            .context("Failed to open artifact log")?;
 
         let log_file_std = log_file.into_std().await;
 
-        info!("正在启动 sing-box...");
+        info!("Spawning sing-box process...");
 
         let child = Command::new(&self.executable)
             .arg("run")
             .arg("-c")
             .arg(&self.config_path)
-            .stdout(Stdio::from(log_file_std.try_clone().context("无法克隆日志文件句柄")?))
+            .stdout(Stdio::from(
+                log_file_std.try_clone().context("Handle cloning error")?,
+            ))
             .stderr(Stdio::from(log_file_std))
-            .kill_on_drop(true)
+            .kill_on_drop(true) // RAII: 释放资源时自动终止
             .spawn()
-            .context("启动 sing-box 进程失败")?;
+            .context("Failed to execute process")?;
 
         *child_guard = Some(child);
         Ok(())
     }
 
+    /// 强制终止进程并释放资源
     pub async fn stop(&self) -> Result<()> {
         let mut child_guard = self.child.lock().await;
         if let Some(mut child) = child_guard.take() {
-            child.kill().await.context("无法停止 sing-box")?;
-            child.wait().await.context("等待 sing-box 退出失败")?;
-            info!("sing-box 已停止");
+            child.kill().await.context("Failed to kill process")?;
+            child.wait().await.context("Process wait error")?;
+            info!("sing-box instance terminated");
         }
         Ok(())
     }
 
+    /// 执行 API 健康检查，确保控制链路就绪
     pub async fn wait_for_api(&self, timeout_secs: u64) -> Result<()> {
         let url = self.api_base.join("proxies")?;
 
@@ -119,20 +137,21 @@ impl SingBoxController {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
-                        debug!("sing-box API 已就绪");
+                        debug!("API endpoint is ready");
                         return Ok::<(), anyhow::Error>(());
                     }
-                    _ => debug!("正在等待 sing-box API 响应..."),
+                    _ => debug!("Awaiting API readiness..."),
                 }
                 sleep(Duration::from_millis(500)).await;
             }
         })
         .await
-        .map_err(|_| anyhow!("等待 sing-box API 超时"))??;
+        .map_err(|_| anyhow!("API readiness timeout"))??;
 
         Ok(())
     }
 
+    /// 动态切换代理选择器的后端节点 (Selector Hot-swapping)
     pub async fn switch_selector(&self, selector: &str, tag: &str) -> Result<()> {
         let url = self.api_base.join(&format!("proxies/{}", selector))?;
         let body = serde_json::json!({ "name": tag });
@@ -149,7 +168,7 @@ impl SingBoxController {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "Failed to switch proxy ({} -> {}): Status {}, Body: {}",
+                "Selector update failed ({} -> {}): Status {}, Body: {}",
                 selector,
                 tag,
                 status,

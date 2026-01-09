@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 
 use crate::core::config::AppConfig;
@@ -11,8 +11,12 @@ use crate::network::context::ServiceContext;
 use crate::network::middleware::{AntiBlockMiddleware, SessionMiddleware, SkipPolicy};
 use crate::network::session::Session;
 
+/// 异步 HTTP 服务层 (Service Layer)
+///
+/// 封装底层 `reqwest` 客户端，集成中间件管线并管理网络会话状态。
 #[derive(Clone)]
 pub struct HttpService {
+    /// 支持热重载的中间件客户端
     client: Arc<RwLock<ClientWithMiddleware>>,
     #[allow(dead_code)]
     config: Arc<AppConfig>,
@@ -21,6 +25,7 @@ pub struct HttpService {
 }
 
 impl HttpService {
+    /// 初始化 HTTP 服务实例
     pub fn new(config: Arc<AppConfig>, session: Arc<Session>) -> Self {
         let client = Self::try_build_internal_client(&config, &session)
             .expect("CRITICAL: Failed to initialize network client");
@@ -31,10 +36,10 @@ impl HttpService {
         }
     }
 
-    /// 重建内部客户端 (Hot Swap)
-    /// 
-    /// 当代理切换或需要刷新连接池时调用。
-    /// 这会创建一个新的 Client（带有新的连接池），旧的 Client 会在所有引用它的任务结束后自动释放。
+    /// 客户端热重载 (Hot Swapping)
+    ///
+    /// 在代理轮换或连接池失效时重建内部客户端实例。
+    /// 利用 Arc 引用计数确保旧客户端在待处理任务完成后平滑释放。
     pub fn recreate_client(&self) -> Result<()> {
         let new_client = Self::try_build_internal_client(&self.config, &self.session)?;
         let mut writer = self.client.write().expect("HttpService lock poisoned");
@@ -42,36 +47,42 @@ impl HttpService {
         Ok(())
     }
 
-    /// 构建底层的 HTTP 客户端
-    fn try_build_internal_client(config: &AppConfig, session: &Session) -> Result<ClientWithMiddleware> {
+    /// 内部客户端工厂函数 (Client Factory)
+    ///
+    /// 配置连接池、代理重定向、超时策略以及注入初始会话凭据。
+    fn try_build_internal_client(
+        config: &AppConfig,
+        session: &Session,
+    ) -> Result<ClientWithMiddleware> {
         let proxy_url = format!("http://127.0.0.1:{}", config.singbox.proxy_port);
         let mut headers = HeaderMap::new();
-        
-        // 基础 Header 注入
+
+        // 基础凭据注入
         let base_headers = [
             (USER_AGENT, session.get_ua()),
             (COOKIE, session.get_cookie().unwrap_or_default()),
         ];
 
         headers.extend(
-            base_headers.into_iter()
+            base_headers
+                .into_iter()
                 .filter(|(_, v)| !v.is_empty())
-                .filter_map(|(k, v)| {
-                    HeaderValue::from_str(&v).ok().map(|val| (k, val))
-                })
+                .filter_map(|(k, v)| HeaderValue::from_str(&v).ok().map(|val| (k, val))),
         );
 
-        // 批量注入 Session Headers
+        // 批量同步 Session Headers
         headers.extend(
-            session.get_headers().iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+            session
+                .get_headers()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
         );
 
         let client_builder = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(proxy_url).map_err(SpiderError::Network)?)
             .default_headers(headers)
             .pool_max_idle_per_host(32)
-            .tcp_nodelay(true)     // 禁用 Nagle 算法，降低小包延迟
+            .tcp_nodelay(true) // 禁用 Nagle 算法以降低交互式请求延迟
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));
@@ -84,12 +95,17 @@ impl HttpService {
             .build())
     }
 
-    /// 获取当前可用的客户端副本
+    /// 获取当前活跃的客户端实例 (Thread-safe)
     pub fn client(&self) -> ClientWithMiddleware {
-        self.client.read().expect("HttpService lock poisoned").clone()
+        self.client
+            .read()
+            .expect("HttpService lock poisoned")
+            .clone()
     }
 
-    /// 核心执行逻辑：乐观且极简
+    /// 请求分发逻辑 (Request Dispatching)
+    ///
+    /// 利用中间件链处理重试、反爬检测及会话同步。
     pub async fn execute(
         &self,
         ctx: &ServiceContext,
@@ -99,15 +115,19 @@ impl HttpService {
     ) -> Result<reqwest::Response> {
         let client = self.client();
 
-        let rb = ctx.request_builder_with_client(client, method, url)
+        let rb = ctx
+            .request_builder_with_client(client, method, url)
             .with_extension(policies);
 
         rb.send().await.map_err(SpiderError::Middleware)
     }
 
-    /// 探测方法 (用于健康检查)
+    /// 连通性探测 (Connectivity Probe)
+    ///
+    /// 绕过所有拦截策略，用于执行基础设施层面的健康检查。
     pub async fn probe(&self, url: &str, ctx: ServiceContext) -> Result<(u16, String)> {
-        let resp = self.client()
+        let resp = self
+            .client()
             .get(url)
             .with_extension(ctx.session.clone())
             .with_extension(ctx)

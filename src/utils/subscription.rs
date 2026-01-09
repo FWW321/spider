@@ -1,3 +1,7 @@
+//! 代理订阅管理工具 (Subscription Management)
+//!
+//! 提供多协议代理节点的解析、去重、持久化缓存及 sing-box 运行时配置生成。
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,8 +16,7 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 use url::Url;
 
-// --- Data Structures ---
-
+/// 代理出口节点封装 (Proxy Outbound Container)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyNode {
     #[serde(flatten)]
@@ -21,6 +24,7 @@ pub struct ProxyNode {
 }
 
 impl ProxyNode {
+    /// 提取节点唯一标识标签
     pub fn tag(&self) -> &str {
         match &self.outbound {
             Outbound::Shadowsocks { tag, .. }
@@ -40,6 +44,7 @@ impl ProxyNode {
     }
 }
 
+/// 支持的代理协议变体 (Protocol Variants)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Outbound {
@@ -85,6 +90,7 @@ pub enum Outbound {
     },
 }
 
+/// 传输层封装协议 (Transport Layer)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum V2RayTransport {
@@ -105,6 +111,7 @@ pub enum V2RayTransport {
     },
 }
 
+/// 安全传输配置 (TLS/uTLS)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsOutbound {
     pub enabled: bool,
@@ -120,9 +127,9 @@ pub struct UtlsConfig {
     pub fingerprint: String,
 }
 
+/// 执行启发式 Base64 解码 (Heuristic Decoding)
 fn decode_base64_auto(input: &str) -> Result<String> {
     let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    // 优先级: Standard -> URL_Safe_No_Pad -> URL_Safe
     let engines = [
         &general_purpose::STANDARD,
         &general_purpose::URL_SAFE_NO_PAD,
@@ -137,6 +144,9 @@ fn decode_base64_auto(input: &str) -> Result<String> {
     Err(anyhow!("Base64 decode failed"))
 }
 
+/// 执行订阅内容解析 (Content Ingestion)
+/// 
+/// 自动识别并解析 Clash YAML 或原始 URI 列表（含 Base64 编码）。
 pub fn parse_subscription_content(content: &str) -> Result<Vec<ProxyNode>> {
     let content = content.trim();
 
@@ -149,14 +159,14 @@ pub fn parse_subscription_content(content: &str) -> Result<Vec<ProxyNode>> {
     };
 
     if let Some(nodes) = try_clash(content) {
-        debug!("成功从 YAML 解析 {} 个节点", nodes.len());
+        debug!("Parsed {} nodes from raw YAML", nodes.len());
         return Ok(nodes);
     }
 
     let decoded = decode_base64_auto(content).unwrap_or_else(|_| content.to_string());
 
     if let Some(nodes) = try_clash(&decoded) {
-        debug!("成功从 Base64 解码的 YAML 中解析 {} 个节点", nodes.len());
+        debug!("Parsed {} nodes from decoded YAML", nodes.len());
         return Ok(nodes);
     }
 
@@ -178,16 +188,15 @@ pub fn parse_subscription_content(content: &str) -> Result<Vec<ProxyNode>> {
         .collect();
 
     if nodes.is_empty() {
-        Err(anyhow!("未发现有效的代理节点"))
+        Err(anyhow!("No valid proxy nodes discovered"))
     } else {
-        debug!("成功解析链接列表: {} 个节点", nodes.len());
+        debug!("Successfully aggregated {} nodes from URI list", nodes.len());
         Ok(nodes)
     }
 }
 
-// --- Protocol Parsers ---
+// --- Protocol-specific Deserializers ---
 
-// 辅助函数：处理 json 中可能是字符串也可能是数字的字段
 fn json_as_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse().ok())
 }
@@ -250,7 +259,6 @@ fn parse_ss(line: &str) -> Option<ProxyNode> {
         .decode_utf8_lossy()
         .to_string();
 
-    // 尝试 SIP002 (ss://user:pass@host:port)
     if let (Some(host), Some(port)) = (url.host_str(), url.port()) {
         let user_info =
             decode_base64_auto(url.username()).unwrap_or_else(|_| url.username().to_string());
@@ -266,7 +274,6 @@ fn parse_ss(line: &str) -> Option<ProxyNode> {
         });
     }
 
-    // 尝试 Legacy (ss://BASE64)
     let body = line.strip_prefix("ss://")?.split('#').next()?;
     let decoded = decode_base64_auto(body).ok()?;
     let (auth, addr) = decoded.rsplit_once('@')?;
@@ -379,12 +386,13 @@ fn parse_vless(line: &str) -> Option<ProxyNode> {
     })
 }
 
+/// 执行 Clash 配置格式的 YAML 解析
 fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>> {
     let root: Value = serde_yml::from_str(content)?;
     let proxies = root
         .get("proxies")
         .and_then(|v| v.as_array())
-        .context("No proxies found")?;
+        .context("Missing 'proxies' key in YAML")?;
 
     Ok(proxies
         .iter()
@@ -487,18 +495,17 @@ fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>> {
         .collect())
 }
 
+/// 节点有效性与黑名单监测
 fn is_valid_node(node: &ProxyNode) -> bool {
     const BLOCKLIST: &[&str] = &[
         "广告", "官网", "流量", "重置", "群", "客服", "更新", "订阅", "expire",
     ];
     let tag = node.tag();
 
-    // 检查关键字
     if BLOCKLIST.iter().any(|&k| tag.contains(k)) {
         return false;
     }
 
-    // 检查本地地址
     match &node.outbound {
         Outbound::Shadowsocks { server, .. }
         | Outbound::Vmess { server, .. }
@@ -507,8 +514,9 @@ fn is_valid_node(node: &ProxyNode) -> bool {
     }
 }
 
-// --- Modern Async Fetching ---
+// --- Subscription Data Fetching ---
 
+/// 批量执行订阅 URL 获取任务并应用持久化缓存
 pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Result<Vec<ProxyNode>> {
     #[derive(Serialize, Deserialize)]
     struct Cache {
@@ -519,12 +527,14 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
     let hash = blake3::hash(urls.join(",").as_bytes()).to_hex().to_string();
     let cache_file = cache_path.join("sub_cache.json");
 
+    // 尝试命中持久化磁盘缓存
     if let Ok(data) = tokio::fs::read_to_string(&cache_file).await
         && let Ok(cache) = serde_json::from_str::<Cache>(&data)
-            && cache.hash == hash {
-                debug!("订阅缓存命中: {} 个节点", cache.nodes.len());
-                return Ok(cache.nodes);
-            }
+        && cache.hash == hash
+    {
+        debug!("Cache hit for subscription: {} nodes recovered", cache.nodes.len());
+        return Ok(cache.nodes);
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
@@ -536,20 +546,20 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
         .map(|url| {
             let client = client.clone();
             async move {
-                debug!("正在获取订阅: {}", url);
+                debug!("Fetching subscription: {}", url);
                 client
                     .get(url)
                     .send()
                     .await
                     .map_err(|e| {
-                        warn!("订阅请求失败 {}: {}", url, e);
+                        warn!("Request failed {}: {}", url, e);
                         e
                     })
                     .ok()?
                     .text()
                     .await
                     .map_err(|e| {
-                        warn!("读取订阅内容失败 {}: {}", url, e);
+                        warn!("Content read error {}: {}", url, e);
                         e
                     })
                     .ok()
@@ -566,6 +576,7 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
         }
     }
 
+    // 标签去重与自动后缀追加
     let mut counts: HashMap<String, usize> = HashMap::new();
     for node in &mut all_nodes {
         let tag = node.tag().to_string();
@@ -592,6 +603,7 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
     Ok(all_nodes)
 }
 
+/// 生成面向 sing-box 的运行时 JSON 配置文件
 pub fn generate_singbox_config(
     nodes: &[ProxyNode],
     proxy_port: u16,
@@ -600,7 +612,7 @@ pub fn generate_singbox_config(
     cache_path: &Path,
 ) -> Result<String> {
     if nodes.is_empty() {
-        return Err(anyhow!("No proxy nodes"));
+        return Err(anyhow!("Node set is empty, configuration aborted"));
     }
 
     let node_tags: Vec<String> = nodes.iter().map(|n| n.tag().to_string()).collect();
@@ -616,7 +628,6 @@ pub fn generate_singbox_config(
         }),
     ];
 
-    // 批量转换节点并添加到列表
     for node in nodes {
         outbound_list.push(serde_json::to_value(&node.outbound)?);
     }
@@ -651,5 +662,5 @@ pub fn generate_singbox_config(
         }
     });
 
-    serde_json::to_string_pretty(&config).context("Serialize config failed")
+    serde_json::to_string_pretty(&config).context("Config serialization failed")
 }

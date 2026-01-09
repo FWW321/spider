@@ -1,6 +1,6 @@
-//! 爬虫引擎调度器
+//! 爬虫调度引擎 (Orchestration Engine)
 //!
-//! 负责协调任务的生命周期：初始化 -> 发现 -> 执行 -> 结束
+//! 负责协调任务的完整生命周期：初始化 (Preparation) -> 发现 (Discovery) -> 执行 (Execution) -> 后处理 (Post-processing)。
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,33 +13,37 @@ use crate::core::config::AppConfig;
 use crate::core::error::{Result, SpiderError};
 use crate::core::event::SpiderEvent;
 use crate::core::model::{Book, BookItem, Chapter};
-use crate::interfaces::site::{Context, TaskArgs};
 use crate::interfaces::Site;
+use crate::interfaces::site::{Context, TaskArgs};
 use crate::network::context::ServiceContext;
 
 use super::context::RuntimeContext;
 use super::task::{Task, TaskResult};
 
-/// 爬虫引擎
+/// 核心调度引擎
 pub struct ScrapeEngine {
+    /// 目标站点抽象
     site: Arc<dyn Site>,
+    /// 网络与全局状态上下文
     core: ServiceContext,
+    /// 全局配置
     config: Arc<AppConfig>,
 }
 
 impl ScrapeEngine {
+    /// 创建引擎实例
     pub fn new(site: Arc<dyn Site>, core: ServiceContext, config: Arc<AppConfig>) -> Self {
         Self { site, core, config }
     }
 
-    /// 执行抓取流程
+    /// 执行完整的抓取任务流
     pub async fn run(&self, mut args: TaskArgs) -> Result<()> {
         let task_id = self.get_id(&args);
-        
-        // 1. 站点预热 (Prepare)
+
+        // 1. 站点环境初始化 (Site Warm-up)
         self.prepare_site(&task_id, &args).await;
 
-        // 2. 书籍发现 (Discover)
+        // 2. 资源发现阶段 (Discovery Phase)
         let book = match self.discover_book(&task_id, &mut args).await {
             Ok(b) => b,
             Err(e) => {
@@ -48,32 +52,33 @@ impl ScrapeEngine {
             }
         };
 
-        // 3. 任务执行循环 (Loop)
-        // 传递引用而非 Clone，减少内存开销
+        // 3. 并发抓取循环 (Concurrent Execution)
         if let Err(e) = self.execute_loop(&book, &args, task_id).await {
             self.fail_task(e.to_string());
             return Err(e);
         }
 
-        // 4. 后处理 (Post-process)
+        // 4. 文档生成与清理 (Post-processing)
         self.generate_epub(book).await?;
         self.finish_task();
 
         Ok(())
     }
 
+    /// 站点环境预热
     async fn prepare_site(&self, task_id: &str, args: &TaskArgs) {
         let site_ctx = Context::new(task_id.to_string(), args.clone(), self.core.clone());
         if let Err(e) = self.site.prepare(&site_ctx).await {
-            warn!("站点预热警告: {}", e);
+            warn!("Site preparation warning: {}", e);
         }
     }
 
+    /// 执行元数据与目录结构的发现
     async fn discover_book(&self, task_id: &str, args: &mut TaskArgs) -> Result<Book> {
-        debug!("正在获取元数据...");
+        debug!("Fetching metadata...");
         let (metadata, discovered_args) = self
             .core
-            .run_optimistic("获取元数据", || {
+            .run_optimistic("Metadata Discovery", || {
                 let site_ctx = Context::new(task_id.to_string(), args.clone(), self.core.clone());
                 let site = self.site.clone();
                 async move { site.fetch_metadata(&site_ctx).await }
@@ -84,19 +89,18 @@ impl ScrapeEngine {
             args.extend(new_args);
         }
 
-        debug!("正在获取章节列表...");
-        // 更新 args 后重新创建 context
+        debug!("Fetching chapter list...");
         let site_ctx = Context::new(task_id.to_string(), args.clone(), self.core.clone());
 
         let mut items = self
             .core
-            .run_optimistic("获取章节列表", || {
+            .run_optimistic("Chapter Discovery", || {
                 let ctx = site_ctx.clone();
                 let site = self.site.clone();
                 async move { site.fetch_chapter_list(&ctx).await }
             })
             .await?;
-            
+
         items.sort_by_key(|item| item.index());
 
         let book = Book::new(
@@ -116,6 +120,7 @@ impl ScrapeEngine {
         Ok(book)
     }
 
+    /// 并发任务执行循环
     async fn execute_loop(&self, book: &Book, args: &TaskArgs, task_id: String) -> Result<()> {
         let text_dir = book.text_dir().await;
         let cover_dir = book.cover_dir().await;
@@ -127,7 +132,7 @@ impl ScrapeEngine {
         self.core.emit(SpiderEvent::ChaptersDiscovered {
             total: total_chapters,
         });
-        info!("共发现 {} 个章节", total_chapters);
+        info!("Found {} chapters", total_chapters);
 
         let concurrency = self
             .site
@@ -150,21 +155,14 @@ impl ScrapeEngine {
         let mut seen_images = HashSet::new();
         let mut failures = Vec::new();
 
-        // 初始化待执行任务队列
-        let mut pending_tasks = self.create_initial_tasks(
-            book, 
-            &text_dir, 
-            &cover_dir, 
-            &images_dir,
-            &mut seen_images
-        );
+        let mut pending_tasks =
+            self.create_initial_tasks(book, &text_dir, &cover_dir, &images_dir, &mut seen_images);
 
-        // 主循环：只要还有等待的任务或正在运行的任务，就继续
         while !pending_tasks.is_empty() || !join_set.is_empty() {
-            // 1. 填充任务槽 (Fill Slots)
+            // 填充并发槽位 (Concurrency Throttling)
             self.fill_task_slots(&mut join_set, &mut pending_tasks, concurrency, &ctx);
 
-            // 2. 等待结果 (Wait)
+            // 处理已完成的任务结果
             if let Some(res) = join_set.join_next().await {
                 self.handle_task_result(res, &mut pending_tasks, &mut seen_images, &mut failures);
             }
@@ -172,77 +170,77 @@ impl ScrapeEngine {
 
         if !failures.is_empty() {
             error!("==========================================");
-            error!("任务完成，但在 {} 个项目中遇到错误:", failures.len());
+            error!("Execution completed with {} failures:", failures.len());
             for (desc, e) in &failures {
                 error!(" - {}: {}", desc, e);
             }
             error!("==========================================");
         } else {
-            info!("采集任务全部成功完成: {}", book.metadata.title);
+            info!("Scraping task completed successfully: {}", book.metadata.title);
         }
 
         Ok(())
     }
 
-    /// 填充任务槽
+    /// 并发槽位填充逻辑 (Fill Slots)
     fn fill_task_slots(
         &self,
-        join_set: &mut JoinSet<std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>>,
+        join_set: &mut JoinSet<
+            std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>,
+        >,
         pending_tasks: &mut VecDeque<Task>,
         concurrency: usize,
         ctx: &Arc<RuntimeContext>,
     ) {
-        while join_set.len() < concurrency && let Some(task) = pending_tasks.pop_front() {
+        while join_set.len() < concurrency
+            && let Some(task) = pending_tasks.pop_front()
+        {
             let task_ctx = ctx.clone();
             let task_desc = task.to_string();
-            
+
             join_set.spawn(async move {
-                // 内部使用了 run_optimistic，会自动处理阻断和重试
+                // 利用 run_optimistic 机制处理熔断与重试
                 task.run(task_ctx).await.map_err(|e| (task_desc, e))
             });
         }
     }
 
-    /// 处理任务结果
+    /// 任务结果传播与后续任务生成
     fn handle_task_result(
         &self,
-        res: std::result::Result<std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>, tokio::task::JoinError>,
+        res: std::result::Result<
+            std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>,
+            tokio::task::JoinError,
+        >,
         pending_tasks: &mut VecDeque<Task>,
         seen_images: &mut HashSet<String>,
         failures: &mut Vec<(String, crate::core::error::SpiderError)>,
     ) {
         match res {
-            Ok(Ok(task_res)) => {
-                if let TaskResult::Spawn(new_tasks) = task_res {
-                    for task in new_tasks {
-                        // 只有未见过的图片任务才添加
-                        if let Task::Image { ref url, .. } = task {
-                            if !seen_images.insert(url.clone()) {
-                                continue;
-                            }
-                        }
-                        pending_tasks.push_front(task);
+            Ok(Ok(TaskResult::Spawn(new_tasks))) => {
+                for task in new_tasks {
+                    match task {
+                        // 基于 URL 的图片去重过滤
+                        Task::Image { ref url, .. } if !seen_images.insert(url.clone()) => continue,
+                        _ => pending_tasks.push_front(task),
                     }
                 }
             }
             Ok(Err((desc, e))) => {
-                // 因为 run_optimistic 会自动处理阻断并重试
-                // 所以如果到了这里，说明是真正的不可恢复错误（如文件IO错误、解析错误等）
-                // 或者重试次数彻底耗尽
-                error!("任务彻底失败 [{}]: {}", desc, e);
+                error!("Task failed fatally [{}]: {}", desc, e);
                 failures.push((desc, e));
             }
             Err(e) => {
-                // 选择记录错误但不直接 panic，尽量保证其他任务能跑完
-                // 但如果是 panic，可能意味着严重的逻辑错误
-                error!("致命错误 (Panic/Cancel): {}", e);
+                error!("Runtime panic or cancellation: {}", e);
             }
+            _ => {}
         }
     }
 
+    /// 构建初始任务队列
     fn create_initial_tasks(
-        &self, 
-        book: &Book, 
+        &self,
+        book: &Book,
         text_dir: &Path,
         cover_dir: &Path,
         images_dir: &Path,
@@ -250,7 +248,7 @@ impl ScrapeEngine {
     ) -> VecDeque<Task> {
         let mut tasks = VecDeque::new();
 
-         // 1. 书籍封面
+        // 书籍封面下载
         if let Some(url) = &book.metadata.cover_url
             && let Some(filename) = book.metadata.cover_filename()
         {
@@ -260,39 +258,36 @@ impl ScrapeEngine {
             });
         }
 
-        // 2. 卷封面
+        // 卷封面下载 (基于唯一 URL 过滤)
         for item in &book.items {
             if let BookItem::Volume(vol) = item
                 && let Some(url) = &vol.cover_url
-                    && let Some(filename) = vol.cover_filename()
-                        && seen_images.insert(url.clone())
+                && let Some(filename) = vol.cover_filename()
+                && seen_images.insert(url.clone())
             {
-                tasks.push_back(
-                    Task::Image {
-                        url: url.clone(),
-                        path: images_dir.join(filename),
-                        source: format!("卷封面: {}", vol.title),
-                    }
-                );
+                tasks.push_back(Task::Image {
+                    url: url.clone(),
+                    path: images_dir.join(filename),
+                    source: format!("Volume Cover: {}", vol.title),
+                });
             }
         }
 
-        // 3. 章节内容
-         for chapter in book.chapters() {
-            tasks.push_back(
-                Task::Chapter {
-                    path: text_dir.join(chapter.filename()),
-                    chapter: chapter.clone(),
-                }
-            );
+        // 章节内容采集
+        for chapter in book.chapters() {
+            tasks.push_back(Task::Chapter {
+                path: text_dir.join(chapter.filename()),
+                chapter: chapter.clone(),
+            });
         }
 
         tasks
     }
 
+    /// 执行 EPUB 编译与生成
     async fn generate_epub(&self, book: Book) -> Result<()> {
         self.core.emit(SpiderEvent::EpubGenerating);
-        info!("正在生成 EPUB 文件...");
+        info!("Generating EPUB artifact...");
 
         let generator = crate::core::epub::EpubGenerator::new(book.clone());
         let output_path = book.base_dir.join(format!("{}.epub", book.unique_id()));
@@ -302,18 +297,18 @@ impl ScrapeEngine {
                 self.core.emit(SpiderEvent::EpubGenerated {
                     path: path.display().to_string(),
                 });
-                info!("EPUB 生成成功: {:?}", path);
+                info!("EPUB generation successful: {:?}", path);
                 Ok(())
             }
             Err(e) => {
-                error!("EPUB 生成失败: {}", e);
+                error!("EPUB generation failed: {}", e);
                 Ok(())
             }
         }
     }
 
     fn fail_task(&self, error: String) {
-        error!("任务执行失败: {}", error);
+        error!("Task failed: {}", error);
         self.core.emit(SpiderEvent::TaskFailed { error });
     }
 
@@ -323,7 +318,7 @@ impl ScrapeEngine {
         });
     }
 
-    /// 解析 ID
+    /// 从参数集中提取任务唯一标识符
     pub fn get_id(&self, args: &TaskArgs) -> String {
         args.get("id")
             .or_else(|| args.iter().find(|(k, _)| k.contains("id")).map(|(_, v)| v))
