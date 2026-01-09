@@ -24,6 +24,7 @@ pub enum TaskResult {
 }
 
 /// 具体的下载任务
+#[derive(Debug)]
 pub enum Task {
     Cover {
         url: String,
@@ -38,6 +39,16 @@ pub enum Task {
         path: PathBuf,
         source: String,
     },
+}
+
+impl std::fmt::Display for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Task::Cover { url, .. } => write!(f, "下载封面 ({})", url),
+            Task::Chapter { chapter, .. } => write!(f, "下载章节 {} - {}", chapter.index, chapter.title),
+            Task::Image { source, url, .. } => write!(f, "下载图片 [{}] ({})", source, url),
+        }
+    }
 }
 
 impl Task {

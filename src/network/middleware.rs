@@ -8,9 +8,16 @@ use crate::interfaces::NetworkPolicy;
 use crate::network::context::ServiceContext;
 use crate::core::error::SpiderError;
 
-/// 跳过反爬逻辑标记
+/// 策略跳过标记
+///
+/// 用于控制请求是否应该绕过某些或所有网络策略
 #[derive(Clone)]
-pub struct SkipAntiBlock;
+pub enum SkipPolicy {
+    /// 跳过所有策略 (通常用于探测、健康检查)
+    All,
+    /// 跳过特定名称的策略 (防止递归调用)
+    One(String),
+}
 
 /// 会话注入中间件
 /// 负责在每次请求前，动态将 Session 中的最新 Cookie/UA 注入 Header
@@ -63,32 +70,37 @@ impl Middleware for AntiBlockMiddleware {
         extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> Result<Response> {
-        if extensions.get::<SkipAntiBlock>().is_some() {
-            return next.run(req, extensions).await;
-        }
-
         let ctx = extensions
             .get::<ServiceContext>()
             .expect("ServiceContext missing")
             .clone();
 
+        // 1. 执行请求
+        let resp = next.run(req, extensions).await?;
+
+        // 2. 策略检查
+        let mut current_resp = resp;
         let policies = extensions
             .get::<Vec<Arc<dyn NetworkPolicy>>>()
             .cloned()
             .unwrap_or_default();
 
-        let resp = next.run(req, extensions).await?;
+        let skip_policy = extensions.get::<SkipPolicy>();
 
-        // 先运行站点策略链（Cloudflare、Captcha 等需要精确检测）
-        let mut current_resp = resp;
         for policy in &policies {
+            // 检查是否需要跳过当前策略
+            match skip_policy {
+                Some(SkipPolicy::All) => break,
+                Some(SkipPolicy::One(name)) if name == policy.name() => continue,
+                _ => {}
+            }
+
             match policy.check(current_resp, &ctx).await {
                 Ok(PolicyResult::Pass(r)) => {
                     current_resp = r;
                 }
                 Ok(PolicyResult::Retry { is_force, reason }) => {
                     if is_force {
-                        // 强制重试：抛出中断信号，让顶层 HttpService 换个 Client 重新来过
                         return Err(reqwest_middleware::Error::from(anyhow::Error::new(
                             SpiderError::RefreshRequired {
                                 reason,
@@ -96,7 +108,6 @@ impl Middleware for AntiBlockMiddleware {
                             }
                         )));
                     } else {
-                        // 普通重试：暂时也可以抛出，让顶层统一处理
                         return Err(reqwest_middleware::Error::from(anyhow::Error::new(
                             SpiderError::RefreshRequired {
                                 reason: format!("Policy retry: {}", reason),
@@ -119,7 +130,8 @@ impl Middleware for AntiBlockMiddleware {
             }
         }
 
-        // 策略链都通过了，再检查是否是通用的 403/429（真正的 IP 封禁）
+        // 3. 基础设施层封禁检查
+        // 除非策略链已经拦截处理了，否则这里作为最后的防线处理 IP 封禁
         let final_status = current_resp.status();
         if final_status == StatusCode::FORBIDDEN || final_status == StatusCode::TOO_MANY_REQUESTS {
             warn!("检测到 {}（策略未处理），正在切换代理并重置会话...", final_status);

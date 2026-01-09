@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 let engine = ScrapeEngine::new(site, ctx, config.clone());
                 let _ = engine.run(args).await;
                 
-                tracing::info!("任务圆满完成: {}", site_id);
+                tracing::info!("任务完成: {}", site_id);
             }
 
             // 此时所有 Sender 已被 Drop，UI 线程将接收到 None 并退出

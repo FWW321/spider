@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::{Response, Method};
 use serde_json::json;
 use tracing::{info, warn};
@@ -9,7 +10,7 @@ use crate::core::error::{Result, SpiderError};
 use crate::interfaces::policy::{NetworkPolicy, PolicyResult};
 use crate::network::context::ServiceContext;
 use crate::network::ResponseExt;
-use crate::network::middleware::SkipAntiBlock;
+use crate::network::middleware::SkipPolicy;
 
 #[derive(Debug)]
 pub struct CaptchaPolicy {
@@ -33,7 +34,7 @@ impl CaptchaPolicy {
             ctx.request_builder(Method::POST, &session_url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(serde_json::to_vec(&json!({})).unwrap_or_default())
-                .with_extension(SkipAntiBlock) // 关键：内部请求不排队
+                .with_extension(SkipPolicy::One("booktoki_captcha".into())) // 仅跳过自己，防止递归
                 .send()
                 .await
                 .map_err(SpiderError::Middleware)?;
@@ -44,7 +45,7 @@ impl CaptchaPolicy {
             
             info!("正在获取验证码图片...");
             let res = ctx.request_builder(Method::GET, &img_url)
-                .with_extension(SkipAntiBlock)
+                .with_extension(SkipPolicy::One("booktoki_captcha".into()))
                 .send()
                 .await
                 .map_err(SpiderError::Middleware)?;
@@ -60,11 +61,16 @@ impl CaptchaPolicy {
             info!("验证码识别成功: {}，正在提交...", code);
 
             // 4. 提交校验
+            let encoded_url = utf8_percent_encode(url, NON_ALPHANUMERIC).to_string();
+            let captcha_page_url = self.normalize(&format!("/bbs/captcha.php?url={}", encoded_url));
             let submit_url = self.normalize("/bbs/captcha_check.php");
             let form = vec![("url".to_string(), url.to_string()), ("captcha_key".to_string(), code)];
+            
             let submit_res = ctx.request_builder(Method::POST, &submit_url)
+                .header(reqwest::header::REFERER, captcha_page_url)
+                .header(reqwest::header::ORIGIN, self.base.to_string())
                 .form(&form)
-                .with_extension(SkipAntiBlock)
+                .with_extension(SkipPolicy::One("booktoki_captcha".into()))
                 .send()
                 .await
                 .map_err(SpiderError::Middleware)?;

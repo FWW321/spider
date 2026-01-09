@@ -2,7 +2,7 @@
 //!
 //! 负责协调任务的生命周期：初始化 -> 发现 -> 执行 -> 结束
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -147,58 +147,100 @@ impl ScrapeEngine {
 
         let mut join_set = JoinSet::new();
         let mut seen_images = HashSet::new();
+        let mut failures = Vec::new();
 
-        // 播种初始任务
-        self.seed_tasks(&mut join_set, &mut seen_images, &book, &text_dir, &cover_dir, &images_dir, &ctx);
+        // 初始化待执行任务队列
+        let mut pending_tasks = self.create_initial_tasks(
+            &book, 
+            &text_dir, 
+            &cover_dir, 
+            &images_dir,
+            &mut seen_images
+        );
 
-        // 主循环
-        while let Some(res) = join_set.join_next().await {
-            let task_res = match res {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    error!("任务执行失败: {}", e);
-                    continue;
+        // 主循环：只要还有等待的任务或正在运行的任务，就继续
+        while !pending_tasks.is_empty() || !join_set.is_empty() {
+            // 1. 填充任务槽 (Fill Slots)
+            while join_set.len() < concurrency && !pending_tasks.is_empty() {
+                if let Some(task) = pending_tasks.pop_front() {
+                    let task_ctx = ctx.clone();
+                    // 这里我们将 task 包装一下，以便在失败时知道是哪个任务
+                    // 但由于 Task 是 consume 的，我们需要在 spawn 前 clone 描述信息，或者 task 本身 clone
+                    // 为了简单和性能，我们在 JoinSet 返回结果时无法直接获取原 Task
+                    // 除非我们将 Task 包装在 Future 中返回。
+                    // 简单的做法：Task::run 失败时，返回特定的 Error 包含描述。
+                    
+                    // 更好的做法：闭包捕获 task 的描述
+                    let task_desc = task.to_string();
+                    join_set.spawn(async move {
+                        task.run(task_ctx).await.map_err(|e| (task_desc, e))
+                    });
                 }
-                Err(e) => {
-                    error!("并发调度错误: {}", e);
-                    continue;
-                }
-            };
+            }
 
-            if let TaskResult::Spawn(new_tasks) = task_res {
-                for task in new_tasks {
-                     if let Task::Image { ref url, .. } = task
-                        && !seen_images.insert(url.clone())
-                    {
-                        continue;
+            // 2. 等待结果 (Wait)
+            if let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(task_res)) => {
+                        if let TaskResult::Spawn(new_tasks) = task_res {
+                            for task in new_tasks {
+                                // 只有未见过的图片任务才添加
+                                if let Task::Image { ref url, .. } = task {
+                                    if !seen_images.insert(url.clone()) {
+                                        continue;
+                                    }
+                                }
+                                // 新产生的任务 (通常是图片) 优先级较高，放到队首
+                                pending_tasks.push_front(task);
+                            }
+                        }
                     }
-                    join_set.spawn(task.run(ctx.clone()));
+                    Ok(Err((desc, e))) => {
+                        error!("任务失败 [{}]: {}", desc, e);
+                        failures.push((desc, e));
+                    }
+                    Err(e) => {
+                        error!("致命错误 (Panic/Cancel): {}", e);
+                        return Err(SpiderError::Custom(format!("Task panic: {}", e)).into());
+                    }
                 }
             }
         }
 
-        info!("采集任务已完成: {}", book.metadata.title);
+        if !failures.is_empty() {
+            error!("==========================================");
+            error!("任务完成，但在 {} 个项目中遇到错误:", failures.len());
+            for (desc, e) in &failures {
+                error!(" - {}: {}", desc, e);
+            }
+            error!("==========================================");
+            // 这里可以选择是否返回 Err，或者只是记录。通常爬虫希望尽可能多地拿数据。
+            // 我们暂且只记录，不视为整个流程失败。
+        } else {
+            info!("采集任务全部成功完成: {}", book.metadata.title);
+        }
+
         Ok(())
     }
 
-    fn seed_tasks(
+    fn create_initial_tasks(
         &self, 
-        set: &mut JoinSet<Result<TaskResult>>, 
-        seen_images: &mut HashSet<String>,
         book: &Book, 
         text_dir: &Path,
         cover_dir: &Path,
         images_dir: &Path,
-        ctx: &Arc<RuntimeContext>
-    ) {
+        seen_images: &mut HashSet<String>,
+    ) -> VecDeque<Task> {
+        let mut tasks = VecDeque::new();
+
          // 1. 书籍封面
         if let Some(url) = &book.metadata.cover_url
             && let Some(filename) = book.metadata.cover_filename()
         {
-            set.spawn(Task::Cover {
+            tasks.push_back(Task::Cover {
                 url: url.clone(),
                 path: cover_dir.join(filename),
-            }.run(ctx.clone()));
+            });
         }
 
         // 2. 卷封面
@@ -208,27 +250,27 @@ impl ScrapeEngine {
                     && let Some(filename) = vol.cover_filename()
                         && seen_images.insert(url.clone())
             {
-                set.spawn(
+                tasks.push_back(
                     Task::Image {
                         url: url.clone(),
                         path: images_dir.join(filename),
                         source: format!("卷封面: {}", vol.title),
                     }
-                    .run(ctx.clone()),
                 );
             }
         }
 
         // 3. 章节内容
          for chapter in book.chapters() {
-            set.spawn(
+            tasks.push_back(
                 Task::Chapter {
                     path: text_dir.join(chapter.filename()),
                     chapter: chapter.clone(),
                 }
-                .run(ctx.clone()),
             );
         }
+
+        tasks
     }
 
     async fn generate_epub(&self, book: Book) -> Result<()> {

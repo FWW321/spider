@@ -8,7 +8,7 @@ use crate::core::config::AppConfig;
 use crate::core::error::{Result, SpiderError};
 use crate::interfaces::NetworkPolicy;
 use crate::network::context::ServiceContext;
-use crate::network::middleware::{AntiBlockMiddleware, SessionMiddleware, SkipAntiBlock};
+use crate::network::middleware::{AntiBlockMiddleware, SessionMiddleware, SkipPolicy};
 use crate::network::session::Session;
 
 #[derive(Clone)]
@@ -95,7 +95,7 @@ impl HttpService {
             .get(url)
             .with_extension(ctx.session.clone())
             .with_extension(ctx)
-            .with_extension(SkipAntiBlock)
+            .with_extension(SkipPolicy::All)
             .send()
             .await
             .map_err(SpiderError::Middleware)?;
