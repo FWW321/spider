@@ -2,6 +2,7 @@
 //!
 //! 封装浏览器相关操作，包括 Cloudflare 绕过等
 
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::path::Path;
 
@@ -15,15 +16,31 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::{
     sync::OnceCell,
     task::JoinHandle,
-    time::{sleep, timeout},
+    time::{interval, timeout},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::core::config::AppConfig;
 use crate::core::error::{Result, SpiderError};
 
 static STEALTH_JS: &str = include_str!("../../stealth.min.js");
 static UA_CACHE: OnceCell<String> = OnceCell::const_new();
+
+/// 默认的浏览器请求头
+static DEFAULT_BROWSER_HEADERS: OnceLock<HeaderMap> = OnceLock::new();
+
+fn get_default_headers() -> &'static HeaderMap {
+    DEFAULT_BROWSER_HEADERS.get_or_init(|| {
+        let mut headers = HeaderMap::new();
+        headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
+        headers.insert(
+            "Accept",
+            HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
+        );
+        headers.insert("Cache-Control", HeaderValue::from_static("max-age=0"));
+        headers
+    })
+}
 
 /// 浏览器会话
 /// 采用显式的所有权管理，确保关闭逻辑的确定性
@@ -36,7 +53,8 @@ impl BrowserSession {
     /// 启动浏览器会话
     pub async fn launch(config: &AppConfig) -> Result<Self> {
         let ua = UA_CACHE.get_or_init(Self::probe_native_ua).await;
-        let browser_config = Self::build_config(config, ua)?;
+        // 将配置构建委托给私有辅助函数
+        let browser_config = build_browser_config(config, ua)?;
 
         let (browser, mut handler) = Browser::launch(browser_config)
             .await
@@ -55,47 +73,6 @@ impl BrowserSession {
             browser: Some(browser),
             handler: Some(handle),
         })
-    }
-
-    fn build_config(config: &AppConfig, ua: &str) -> Result<BrowserConfig> {
-        let mut builder = BrowserConfig::builder()
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg(format!("--user-agent={}", ua))
-            .arg("--disable-infobars")
-            .arg("--no-sandbox")
-            .arg("--window-size=1920,1080")
-            .arg("--disable-extensions")
-            .arg(format!(
-                "--proxy-server=http://127.0.0.1:{}",
-                config.singbox.proxy_port
-            ));
-
-        if config.browser.headless {
-            builder = builder.arg("--headless=new");
-        } else {
-            builder = builder.with_head();
-        }
-
-        let chrome_path = if let Some(path) = &config.browser.chrome_path {
-            Some(path.clone())
-        } else {
-            let default_paths = [
-                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            ];
-            default_paths
-                .iter()
-                .find(|p| Path::new(p).exists())
-                .map(|p| p.to_string())
-        };
-
-        if let Some(path) = chrome_path {
-            builder = builder.chrome_executable(path);
-        }
-
-        builder.build().map_err(SpiderError::Browser)
     }
 
     /// 创建新页面
@@ -135,6 +112,7 @@ impl BrowserSession {
     async fn probe_native_ua() -> String {
         debug!("正在探测系统原生 User-Agent...");
 
+        // 简化的探测配置
         let config = match BrowserConfig::builder()
             .arg("--headless=new")
             .arg("--no-sandbox")
@@ -165,10 +143,10 @@ impl BrowserSession {
         }
         .await;
 
-        // 显式保证关闭顺序：先 close，再 await handler，最后再让 browser 离开作用域
         let _ = browser.close().await;
         let _ = handle.await;
-        sleep(Duration::from_millis(100)).await; // 额外等待以确保 OS 释放资源
+        // 允许 OS 回收资源
+        tokio::time::sleep(Duration::from_millis(100)).await;
         drop(browser);
 
         match result {
@@ -188,13 +166,54 @@ impl BrowserSession {
     }
 }
 
+/// 构建浏览器配置
+fn build_browser_config(config: &AppConfig, ua: &str) -> Result<BrowserConfig> {
+    let mut builder = BrowserConfig::builder()
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg(format!("--user-agent={}", ua))
+        .arg("--disable-infobars")
+        .arg("--no-sandbox")
+        .arg("--window-size=1920,1080")
+        .arg("--disable-extensions")
+        .arg(format!(
+            "--proxy-server=http://127.0.0.1:{}",
+            config.singbox.proxy_port
+        ));
+
+    if config.browser.headless {
+        builder = builder.arg("--headless=new");
+    } else {
+        builder = builder.with_head();
+    }
+
+    let chrome_path = if let Some(path) = &config.browser.chrome_path {
+        Some(path.clone())
+    } else {
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .map(|p| p.to_string())
+    };
+
+    if let Some(path) = chrome_path {
+        builder = builder.chrome_executable(path);
+    }
+
+    builder.build().map_err(SpiderError::Browser)
+}
+
 // 在 Drop 时尝试最后一次保护，但不报 WARN
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         if self.browser.is_some() {
             let mut browser = self.browser.take().unwrap();
             let handler = self.handler.take();
-            // 在后台悄悄清理
+            // 在后台清理
             tokio::spawn(async move {
                 let _ = browser.close().await;
                 if let Some(h) = handler {
@@ -235,10 +254,11 @@ impl BrowserService {
                     return Ok(());
                 }
                 Err(e) => {
-                    warn!("尝试失败: {}", e);
+                    // 使用 info 级别，因为切 IP 是常规操作
+                    info!("尝试失败，准备切换代理: {}", e);
                     last_error = Some(e);
                     ctx.force_rotate_proxy().await;
-                    sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
         }
@@ -284,47 +304,55 @@ impl BrowserService {
         Ok(())
     }
 
+    /// 等待挑战 (Cloudflare/验证码)
     async fn wait_for_challenge(&self, page: &Page) -> Result<()> {
         timeout(Duration::from_secs(25), async {
+            let mut ticker = interval(Duration::from_secs(1));
+            
             loop {
+                ticker.tick().await;
+
+                // 1. 获取标题，如果获取失败（如页面崩溃），视为空并继续等待
                 let title = page
                     .get_title()
                     .await
-                    .unwrap_or(Some("".into()))
+                    .unwrap_or_default()
                     .unwrap_or_default()
                     .to_lowercase();
 
+                // 2. 检查致命封锁 (Guard Clause)
                 if title.contains("403 forbidden") || title.contains("access denied") {
                     return Err(SpiderError::SoftBlock("ip_blocked_in_browser".into()));
                 }
 
-                // 检查标题是否跳过了 Cloudflare 等待页
-                let title_ok = !title.is_empty()
-                    && !title.contains("just a moment")
-                    && !title.contains("cloudflare");
-
-                if title_ok {
-                    let cookies = page.get_cookies().await.unwrap_or_default();
-                    if cookies.iter().any(|c| c.name == "cf_clearance") {
-                         debug!("页面验证通过且获取到 cf_clearance (标题: {})", title);
-                         return Ok(());
-                    }
-                    // 如果没有 clearance，即使标题对了也继续等（或者直到超时）
-                    debug!("页面已跳转但缺少 cf_clearance，继续等待...");
+                // 3. 检查是否还在等待页
+                if title.is_empty() || title.contains("just a moment") || title.contains("cloudflare") {
+                    debug!("正在等待 Cloudflare 跳转 (当前标题: {})...", title);
+                    continue;
                 }
 
-                sleep(Duration::from_secs(1)).await;
+                // 4. 标题正常，检查关键 Cookie
+                let cookies = page.get_cookies().await.unwrap_or_default();
+                if cookies.iter().any(|c| c.name == "cf_clearance") {
+                    debug!("页面验证通过且获取到 cf_clearance (标题: {})", title);
+                    return Ok(());
+                }
+
+                // 5. 标题虽然正常，但没拿到 Cookie，继续等待
+                debug!("页面已跳转但缺少 cf_clearance，继续等待...");
             }
         })
         .await
         .map_err(|_| SpiderError::Browser("Cloudflare 绕过超时".into()))?
     }
 
+    /// 提取数据并保存到 Session
     async fn extract_and_save_data(
         &self,
         page: &Page,
         ctx: &crate::network::context::ServiceContext,
     ) -> Result<()> {
+        // 1. 提取并保存 Cookie
         let cookies = page
             .get_cookies()
             .await
@@ -339,22 +367,18 @@ impl BrowserService {
             ctx.session.set_cookie(cookie_str);
         }
 
-        if let Ok(ua_val) = page.evaluate("navigator.userAgent").await
-            && let Ok(ua) = ua_val.into_value::<String>()
-                && !ua.is_empty() {
+        // 2. 提取并保存 UA (使用 if let 简化)
+        if let Ok(ua_val) = page.evaluate("navigator.userAgent").await {
+            if let Ok(ua) = ua_val.into_value::<String>() {
+                if !ua.is_empty() {
                     ctx.session.set_ua(ua);
                 }
+            }
+        }
 
-        // 设置基础 Header
-        let mut headers = HeaderMap::new();
-        headers.insert("Upgrade-Insecure-Requests", HeaderValue::from_static("1"));
-        headers.insert(
-            "Accept",
-            HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"),
-        );
-        headers.insert("Cache-Control", HeaderValue::from_static("max-age=0"));
-
-        ctx.session.set_headers(headers);
+        // 3. 设置静态 Headers (零分配)，reqwest::Client 的 Headers 克隆开销很小 (Arc 内部共享)
+        ctx.session.set_headers(get_default_headers().clone());
+        
         Ok(())
     }
 }

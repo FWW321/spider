@@ -20,6 +20,7 @@ pub struct SiteSelectors {
     pub wr_subject_link: Selector,
     pub wr_num: Selector,
     pub pagination_next: Selector,
+    pub btn_next: Selector,
     pub novel_content: Selector,
     pub paragraph: Selector,
 }
@@ -42,6 +43,7 @@ impl SiteSelectors {
             wr_subject_link: Selector::parse("div.wr-subject > a").unwrap(),
             wr_num: Selector::parse("div.wr-num").unwrap(),
             pagination_next: Selector::parse("ul.pagination li.active + li a[href]").unwrap(),
+            btn_next: Selector::parse("a.btn-next").unwrap(),
             novel_content: Selector::parse("div#novel_content").unwrap(),
             paragraph: Selector::parse("p").unwrap(),
         })

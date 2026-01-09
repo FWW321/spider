@@ -107,15 +107,16 @@ impl ServiceContext {
     /// 封装"试错-等待-重试"逻辑。
     /// 如果遇到 IP 封禁或 Cloudflare 阻断，会自动触发恢复流程（切 IP / 等待）并无限重试，
     /// 直到任务成功或遇到不可恢复的错误。
-    pub async fn run_optimistic<F, Fut, T>(&self, desc: impl std::fmt::Display, task: F) -> crate::core::error::Result<T>
+    pub async fn run_optimistic<F, Fut, T>(&self, desc: impl std::fmt::Display, task: F) -> Result<T>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = crate::core::error::Result<T>>,
+        Fut: std::future::Future<Output = Result<T>>,
     {
-        use crate::core::error::SpiderError;
-
         let mut attempts = 0;
-        let max_attempts = 10;
+        let max_retries = 10;
+        // 指数退避参数
+        let base_delay = Duration::from_millis(500);
+        let max_delay = Duration::from_secs(5);
 
         loop {
             attempts += 1;
@@ -123,57 +124,44 @@ impl ServiceContext {
             match task().await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    // 1. 解析错误原因
-                    let block_reason = match &e {
-                        SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
-                        SpiderError::Middleware(mw_err) => {
-                            match mw_err {
-                                reqwest_middleware::Error::Middleware(anyhow_err) => {
-                                    if let Some(inner) = anyhow_err.downcast_ref::<SpiderError>() {
-                                        match inner {
-                                            SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
-                                            _ => None,
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                },
-                                _ => None,
-                            }
-                        },
-                        _ => None,
-                    };
-
-                    // 2. 如果是阻断性错误，自动执行恢复
-                    if let Some(reason) = block_reason {
-                        warn!("任务遭遇阻断 [{}] ({})，正在执行自动恢复...", desc, reason);
+                    // 1. 检查是否为阻断性错误 (IP 封禁 / Cloudflare)
+                    if let Some(reason) = e.is_blocking() {
+                        info!("任务遭遇阻断 [{}] ({})，正在执行自动恢复...", desc, reason);
                         
+                        // 针对性恢复策略
                         if reason.contains("HTTP 403") || reason.contains("HTTP 429") {
                             self.rotate_proxy().await;
                         }
                         
-                        // 等待系统恢复 Running 状态（可能由其他线程触发了修复）
                         self.wait_if_blocked().await;
-                        
-                        // 恢复后重置尝试次数，因为环境已经刷新
-                        attempts = 0;
+                        attempts = 0; // 环境已重置，重置尝试计数
                         continue;
                     }
 
-                    // 3. 普通网络错误，进行有限次重试
-                    if attempts >= max_attempts {
+                    // 2. 达到最大重试次数，放弃
+                    if attempts >= max_retries {
                         return Err(e);
                     }
 
-                    // 检查系统状态（防止在系统阻塞时进行无意义重试）
+                    // 3. 计算指数退避时间 (Exponential Backoff with Jitter)
+                    // delay = min(max_delay, base * 2^(attempts-1))
+                    let backoff = base_delay.checked_mul(1 << (attempts - 1)).unwrap_or(max_delay).min(max_delay);
+                    // 添加 10% 的随机抖动，防止共振 (Simple pseudo-random using system time)
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos();
+                    let random_factor = (nanos % 100) as f32 / 1000.0; // 0.000 to 0.099
+                    let jitter = backoff.mul_f32(random_factor); 
+                    let wait_time = backoff + jitter;
+
                     self.wait_if_blocked().await;
 
-                    let wait = std::time::Duration::from_millis(500 * attempts as u64);
                     warn!(
                         "任务失败 [{}] (第 {}/{} 次): {}。将在 {:?} 后重试...",
-                        desc, attempts, max_attempts, e, wait
+                        desc, attempts, max_retries, e, wait_time
                     );
-                    tokio::time::sleep(wait).await;
+                    tokio::time::sleep(wait_time).await;
                 }
             }
         }
@@ -212,6 +200,12 @@ impl ServiceContext {
                     debug!("代理节点已完成物理切换");
                     // 切换 IP 后，必须清除旧会话 (Cookie/UA)，确保身份彻底刷新
                     self.session.clear();
+                    
+                    // 重置 HTTP 客户端 (清除旧的连接池)
+                    // 否则 Keep-Alive 的连接可能会连到旧的 IP (取决于 sing-box 行为)
+                    if let Err(e) = self.http.recreate_client() {
+                        warn!("重置 HTTP 客户端失败: {}", e);
+                    }
                 }
                 Err(_) => warn!("代理切换响应超时"),
             }

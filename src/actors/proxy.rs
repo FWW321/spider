@@ -52,9 +52,9 @@ impl ProxyManager {
         info!("代理服务初始化完成");
 
         let order_file = cache_path.join("proxy_order.json");
-        if order_file.exists()
-            && let Ok(json) = std::fs::read_to_string(&order_file)
-                && let Ok(ordered_tags) = serde_json::from_str::<Vec<String>>(&json) {
+        if order_file.exists() {
+            if let Ok(json) = tokio::fs::read_to_string(&order_file).await {
+                if let Ok(ordered_tags) = serde_json::from_str::<Vec<String>>(&json) {
                     debug!("加载缓存的代理排序 ({} 条记录)", ordered_tags.len());
 
                     let mut reordered = Vec::with_capacity(nodes.len());
@@ -69,6 +69,8 @@ impl ProxyManager {
                     reordered.extend(node_map.into_values());
                     nodes = reordered;
                 }
+            }
+        }
 
         let config_content = subscription::generate_singbox_config(
             &nodes,

@@ -19,13 +19,9 @@ pub struct OriginalUrl(pub String);
 /// 响应元数据，用于在 Response 被消费后重建
 pub struct ResponseMetadata {
     pub status: reqwest::StatusCode,
-
     pub version: reqwest::Version,
-
     pub headers: HeaderMap,
-
     pub url: String,
-
     pub remote_addr: Option<std::net::SocketAddr>,
 }
 
@@ -33,13 +29,9 @@ impl ResponseMetadata {
     pub fn from_response(resp: &Response) -> Self {
         Self {
             status: resp.status(),
-
             version: resp.version(),
-
             headers: resp.headers().clone(),
-
             url: resp.original_url().to_string(),
-
             remote_addr: resp.remote_addr(),
         }
     }
@@ -54,15 +46,12 @@ impl ResponseMetadata {
         let mut new_resp = Response::from(http_resp);
 
         // 复制所有 Headers
-
         *new_resp.headers_mut() = self.headers;
 
         // 保留原始 URL 扩展
-
         new_resp.extensions_mut().insert(OriginalUrl(self.url));
 
         // 保留远程地址信息
-
         if let Some(addr) = self.remote_addr {
             new_resp.extensions_mut().insert(addr);
         }
@@ -71,7 +60,7 @@ impl ResponseMetadata {
     }
 }
 
-/// 响应扩展 Trait，提供更优雅的信息获取方式
+/// 响应扩展 Trait
 pub trait ResponseExt {
     /// 获取原始 URL (优先从扩展中读取，否则从 Response 自带的 URL 读取)
     fn original_url(&self) -> &str;

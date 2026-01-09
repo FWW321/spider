@@ -104,12 +104,14 @@ impl CaptchaPolicy {
         if let Some(_guard) = ctx.coordinator.try_acquire_fix(BlockReason::Custom("captcha".into())).await {
             match self.do_solve_captcha(target_url, ctx).await {
                 Ok(_) => {
-                    // 修复成功，返回"强力重试"指令
+                    // 修复成功，返回"强制重试"指令
                     Ok(PolicyResult::Retry { is_force: true, reason: "captcha_solved".into() })
                 }
                 Err(e) => {
                     // 修复失败，旋转代理
-                    ctx.rotate_proxy().await;
+                    // CRITICAL: 必须使用 force_rotate_proxy，因为当前已经持有了 FixGuard。
+                    // 调用带锁的 rotate_proxy() 会尝试再次抢锁，导致死锁 (Waiting for self)。
+                    ctx.force_rotate_proxy().await;
                     Err(e)
                 }
             }

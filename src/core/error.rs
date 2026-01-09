@@ -43,3 +43,31 @@ pub enum SpiderError {
 }
 
 pub type Result<T> = std::result::Result<T, SpiderError>;
+
+impl SpiderError {
+    /// 判断是否为严重的阻断性错误 (需要切 IP 或 启动浏览器)
+    pub fn is_blocking(&self) -> Option<String> {
+        match self {
+            SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
+            SpiderError::SoftBlock(reason) => Some(reason.clone()),
+            SpiderError::Middleware(reqwest_middleware::Error::Middleware(anyhow_err)) => {
+                // 尝试解包 middleware 中的原始错误
+                if let Some(inner) = anyhow_err.downcast_ref::<SpiderError>() {
+                    inner.is_blocking()
+                } else {
+                    None
+                }
+            }
+            // 检查 reqwest 的特定状态码 (虽然通常由 middleware 拦截，但作为兜底)
+            SpiderError::Network(e) => {
+                if let Some(status) = e.status() {
+                    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        return Some(format!("HTTP {}", status));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+}

@@ -52,7 +52,7 @@ impl BooktokiIndexer {
         let s = SiteSelectors::get();
 
         let detail = doc.select(&s.detail_desc).next().ok_or_else(|| {
-            // 如果在重试后仍然找不到，那确实是解析错误或死链
+            // 如果在重试后仍然找不到，说明是解析错误或死链
             SpiderError::Parse("Detail element not found (Structure changed or invalid ID)".into())
         })?;
 

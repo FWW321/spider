@@ -35,9 +35,16 @@ impl EpubGenerator {
             None => PathBuf::from(format!("{}.epub", self.book.id)),
         };
 
-        let file = std::fs::File::create(&final_path)
-            .with_context(|| format!("创建文件失败: {:?}", final_path))?;
-        builder.generate(file).map_err(|e| anyhow::anyhow!(e))?;
+        // 将 CPU 密集型 (ZIP 压缩) 和 阻塞 I/O 操作卸载到专用线程池
+        let final_path_clone = final_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let file = std::fs::File::create(&final_path_clone)
+                .with_context(|| format!("创建文件失败: {:?}", final_path_clone))?;
+            builder.generate(file).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("JoinError: {}", e))??;
 
         Ok(final_path)
     }

@@ -70,11 +70,15 @@ impl SingBoxController {
         }
 
         let log_path = self.config_path.with_file_name("sing-box.log");
-        let log_file = std::fs::OpenOptions::new()
+        
+        let log_file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
+            .await
             .context("无法打开 sing-box 日志文件")?;
+
+        let log_file_std = log_file.into_std().await;
 
         info!("正在启动 sing-box...");
 
@@ -82,8 +86,8 @@ impl SingBoxController {
             .arg("run")
             .arg("-c")
             .arg(&self.config_path)
-            .stdout(Stdio::from(log_file.try_clone()?))
-            .stderr(Stdio::from(log_file))
+            .stdout(Stdio::from(log_file_std.try_clone().context("无法克隆日志文件句柄")?))
+            .stderr(Stdio::from(log_file_std))
             .kill_on_drop(true)
             .spawn()
             .context("启动 sing-box 进程失败")?;

@@ -37,17 +37,30 @@ impl BooktokiFetcher {
         })?;
 
         // 2. 遍历 <p> 标签并过滤 Spam
-        // 如果没有 <p> 标签，说明该章内容为空
+        // 优化：避免在过滤阶段进行 String 分配
         let content = node
             .select(&s.paragraph)
             .filter_map(|p| {
-                let text = p.text().collect::<String>();
-                let trimmed = text.trim();
+                let mut byte_len = 0;
+                let mut all_alphanum = true;
+                let mut has_content = false;
 
-                // Spam 过滤器：过滤乱码干扰行
-                let is_spam = trimmed.len() > 40
-                    && !trimmed.is_empty()
-                    && trimmed.chars().all(|c| c.is_alphanumeric());
+                // Zero-allocation spam check
+                'check: for slice in p.text() {
+                    for c in slice.chars() {
+                        if !c.is_whitespace() {
+                            has_content = true;
+                            byte_len += c.len_utf8();
+                            if !c.is_alphanumeric() {
+                                all_alphanum = false;
+                                break 'check; // 发现非字母数字字符，肯定不是 Spam
+                            }
+                        }
+                    }
+                }
+
+                // Spam 定义：长度 > 40 且全是字母/数字
+                let is_spam = has_content && byte_len > 40 && all_alphanum;
 
                 if is_spam {
                     None
@@ -59,10 +72,8 @@ impl BooktokiFetcher {
             .join("\n");
 
         // 3. 解析下一页链接
-        let next_selector = Selector::parse("a.btn-next")
-            .map_err(|_| SpiderError::Parse("Invalid next selector".into()))?;
         let next_url = doc
-            .select(&next_selector)
+            .select(&s.btn_next)
             .next()
             .and_then(|el| el.value().attr("href"))
             .map(|href| crate::utils::to_absolute_url(&self.base, href));

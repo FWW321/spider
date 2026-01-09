@@ -49,7 +49,8 @@ impl ScrapeEngine {
         };
 
         // 3. 任务执行循环 (Loop)
-        if let Err(e) = self.execute_loop(book.clone(), &args, task_id).await {
+        // 传递引用而非 Clone，减少内存开销
+        if let Err(e) = self.execute_loop(&book, &args, task_id).await {
             self.fail_task(e.to_string());
             return Err(e);
         }
@@ -115,7 +116,7 @@ impl ScrapeEngine {
         Ok(book)
     }
 
-    async fn execute_loop(&self, book: Book, args: &TaskArgs, task_id: String) -> Result<()> {
+    async fn execute_loop(&self, book: &Book, args: &TaskArgs, task_id: String) -> Result<()> {
         let text_dir = book.text_dir().await;
         let cover_dir = book.cover_dir().await;
         let images_dir = book.images_dir().await;
@@ -151,7 +152,7 @@ impl ScrapeEngine {
 
         // 初始化待执行任务队列
         let mut pending_tasks = self.create_initial_tasks(
-            &book, 
+            book, 
             &text_dir, 
             &cover_dir, 
             &images_dir,
@@ -161,46 +162,11 @@ impl ScrapeEngine {
         // 主循环：只要还有等待的任务或正在运行的任务，就继续
         while !pending_tasks.is_empty() || !join_set.is_empty() {
             // 1. 填充任务槽 (Fill Slots)
-            while join_set.len() < concurrency && !pending_tasks.is_empty() {
-                if let Some(task) = pending_tasks.pop_front() {
-                    let task_ctx = ctx.clone();
-                    let task_desc = task.to_string();
-                    
-                    join_set.spawn(async move {
-                        // 这里的 Task::run 内部使用了 run_optimistic，会自动处理阻断和重试
-                        task.run(task_ctx).await.map_err(|e| (task_desc, e))
-                    });
-                }
-            }
+            self.fill_task_slots(&mut join_set, &mut pending_tasks, concurrency, &ctx);
 
             // 2. 等待结果 (Wait)
             if let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(task_res)) => {
-                        if let TaskResult::Spawn(new_tasks) = task_res {
-                            for task in new_tasks {
-                                // 只有未见过的图片任务才添加
-                                if let Task::Image { ref url, .. } = task {
-                                    if !seen_images.insert(url.clone()) {
-                                        continue;
-                                    }
-                                }
-                                pending_tasks.push_front(task);
-                            }
-                        }
-                    }
-                    Ok(Err((desc, e))) => {
-                        // 因为 run_optimistic 会自动处理阻断并重试
-                        // 所以如果到了这里，说明是真正的不可恢复错误（如文件IO错误、解析错误等）
-                        // 或者重试次数彻底耗尽
-                        error!("任务彻底失败 [{}]: {}", desc, e);
-                        failures.push((desc, e));
-                    }
-                    Err(e) => {
-                        error!("致命错误 (Panic/Cancel): {}", e);
-                        return Err(SpiderError::Custom(format!("Task panic: {}", e)).into());
-                    }
-                }
+                self.handle_task_result(res, &mut pending_tasks, &mut seen_images, &mut failures);
             }
         }
 
@@ -216,6 +182,62 @@ impl ScrapeEngine {
         }
 
         Ok(())
+    }
+
+    /// 填充任务槽
+    fn fill_task_slots(
+        &self,
+        join_set: &mut JoinSet<std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>>,
+        pending_tasks: &mut VecDeque<Task>,
+        concurrency: usize,
+        ctx: &Arc<RuntimeContext>,
+    ) {
+        while join_set.len() < concurrency && let Some(task) = pending_tasks.pop_front() {
+            let task_ctx = ctx.clone();
+            let task_desc = task.to_string();
+            
+            join_set.spawn(async move {
+                // 内部使用了 run_optimistic，会自动处理阻断和重试
+                task.run(task_ctx).await.map_err(|e| (task_desc, e))
+            });
+        }
+    }
+
+    /// 处理任务结果
+    fn handle_task_result(
+        &self,
+        res: std::result::Result<std::result::Result<TaskResult, (String, crate::core::error::SpiderError)>, tokio::task::JoinError>,
+        pending_tasks: &mut VecDeque<Task>,
+        seen_images: &mut HashSet<String>,
+        failures: &mut Vec<(String, crate::core::error::SpiderError)>,
+    ) {
+        match res {
+            Ok(Ok(task_res)) => {
+                if let TaskResult::Spawn(new_tasks) = task_res {
+                    for task in new_tasks {
+                        // 只有未见过的图片任务才添加
+                        if let Task::Image { ref url, .. } = task {
+                            if !seen_images.insert(url.clone()) {
+                                continue;
+                            }
+                        }
+                        pending_tasks.push_front(task);
+                    }
+                }
+            }
+            Ok(Err((desc, e))) => {
+                // 因为 run_optimistic 会自动处理阻断并重试
+                // 所以如果到了这里，说明是真正的不可恢复错误（如文件IO错误、解析错误等）
+                // 或者重试次数彻底耗尽
+                error!("任务彻底失败 [{}]: {}", desc, e);
+                failures.push((desc, e));
+            }
+            Err(e) => {
+                // 选择记录错误但不直接 panic，尽量保证其他任务能跑完
+                // 但如果是 panic，可能意味着严重的逻辑错误
+                error!("致命错误 (Panic/Cancel): {}", e);
+            }
+        }
     }
 
     fn create_initial_tasks(

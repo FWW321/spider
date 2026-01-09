@@ -83,7 +83,7 @@ fn default_headless() -> bool {
     true
 }
 fn default_concurrency() -> usize {
-    5
+    32
 }
 fn default_retry_count() -> u32 {
     3
