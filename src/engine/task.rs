@@ -24,7 +24,7 @@ pub enum TaskResult {
 }
 
 /// 具体的下载任务
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Task {
     Cover {
         url: String,

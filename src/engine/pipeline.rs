@@ -164,15 +164,10 @@ impl ScrapeEngine {
             while join_set.len() < concurrency && !pending_tasks.is_empty() {
                 if let Some(task) = pending_tasks.pop_front() {
                     let task_ctx = ctx.clone();
-                    // 这里我们将 task 包装一下，以便在失败时知道是哪个任务
-                    // 但由于 Task 是 consume 的，我们需要在 spawn 前 clone 描述信息，或者 task 本身 clone
-                    // 为了简单和性能，我们在 JoinSet 返回结果时无法直接获取原 Task
-                    // 除非我们将 Task 包装在 Future 中返回。
-                    // 简单的做法：Task::run 失败时，返回特定的 Error 包含描述。
-                    
-                    // 更好的做法：闭包捕获 task 的描述
                     let task_desc = task.to_string();
+                    
                     join_set.spawn(async move {
+                        // 这里的 Task::run 内部使用了 run_optimistic，会自动处理阻断和重试
                         task.run(task_ctx).await.map_err(|e| (task_desc, e))
                     });
                 }
@@ -190,13 +185,15 @@ impl ScrapeEngine {
                                         continue;
                                     }
                                 }
-                                // 新产生的任务 (通常是图片) 优先级较高，放到队首
                                 pending_tasks.push_front(task);
                             }
                         }
                     }
                     Ok(Err((desc, e))) => {
-                        error!("任务失败 [{}]: {}", desc, e);
+                        // 因为 run_optimistic 会自动处理阻断并重试
+                        // 所以如果到了这里，说明是真正的不可恢复错误（如文件IO错误、解析错误等）
+                        // 或者重试次数彻底耗尽
+                        error!("任务彻底失败 [{}]: {}", desc, e);
                         failures.push((desc, e));
                     }
                     Err(e) => {
@@ -214,8 +211,6 @@ impl ScrapeEngine {
                 error!(" - {}: {}", desc, e);
             }
             error!("==========================================");
-            // 这里可以选择是否返回 Err，或者只是记录。通常爬虫希望尽可能多地拿数据。
-            // 我们暂且只记录，不视为整个流程失败。
         } else {
             info!("采集任务全部成功完成: {}", book.metadata.title);
         }

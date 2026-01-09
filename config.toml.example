@@ -26,4 +26,4 @@ retry_count = 3               # 请求失败时的最大重试次数
 # 站点特定配置
 [sites.booktoki]
 base_url = "https://booktoki469.com" # 站点基础 URL
-concurrent_tasks = 3                 # 该站点的并发限制 (覆盖全局配置)
+concurrent_tasks = 10                 # 该站点的并发限制 (覆盖全局配置)

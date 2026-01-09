@@ -102,15 +102,18 @@ impl ServiceContext {
         self.http.probe(url, self.clone()).await
     }
 
-    /// 乐观执行器
+    /// 乐观执行器 (带自动恢复)
     /// 
-    /// 封装"试错-等待-重试"的逻辑。
-    pub async fn run_optimistic<F, Fut, T, E>(&self, desc: impl std::fmt::Display, task: F) -> std::result::Result<T, E>
+    /// 封装"试错-等待-重试"逻辑。
+    /// 如果遇到 IP 封禁或 Cloudflare 阻断，会自动触发恢复流程（切 IP / 等待）并无限重试，
+    /// 直到任务成功或遇到不可恢复的错误。
+    pub async fn run_optimistic<F, Fut, T>(&self, desc: impl std::fmt::Display, task: F) -> crate::core::error::Result<T>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<T, E>>,
-        E: std::fmt::Display + Send + Sync + 'static, // 简化错误约束
+        Fut: std::future::Future<Output = crate::core::error::Result<T>>,
     {
+        use crate::core::error::SpiderError;
+
         let mut attempts = 0;
         let max_attempts = 10;
 
@@ -120,11 +123,49 @@ impl ServiceContext {
             match task().await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    // 1. 解析错误原因
+                    let block_reason = match &e {
+                        SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
+                        SpiderError::Middleware(mw_err) => {
+                            match mw_err {
+                                reqwest_middleware::Error::Middleware(anyhow_err) => {
+                                    if let Some(inner) = anyhow_err.downcast_ref::<SpiderError>() {
+                                        match inner {
+                                            SpiderError::RefreshRequired { reason, .. } => Some(reason.clone()),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                },
+                                _ => None,
+                            }
+                        },
+                        _ => None,
+                    };
+
+                    // 2. 如果是阻断性错误，自动执行恢复
+                    if let Some(reason) = block_reason {
+                        warn!("任务遭遇阻断 [{}] ({})，正在执行自动恢复...", desc, reason);
+                        
+                        if reason.contains("HTTP 403") || reason.contains("HTTP 429") {
+                            self.rotate_proxy().await;
+                        }
+                        
+                        // 等待系统恢复 Running 状态（可能由其他线程触发了修复）
+                        self.wait_if_blocked().await;
+                        
+                        // 恢复后重置尝试次数，因为环境已经刷新
+                        attempts = 0;
+                        continue;
+                    }
+
+                    // 3. 普通网络错误，进行有限次重试
                     if attempts >= max_attempts {
                         return Err(e);
                     }
 
-                    // 核心逻辑：失败后检查系统状态。
+                    // 检查系统状态（防止在系统阻塞时进行无意义重试）
                     self.wait_if_blocked().await;
 
                     let wait = std::time::Duration::from_millis(500 * attempts as u64);
@@ -169,6 +210,8 @@ impl ServiceContext {
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(_) => {
                     debug!("代理节点已完成物理切换");
+                    // 切换 IP 后，必须清除旧会话 (Cookie/UA)，确保身份彻底刷新
+                    self.session.clear();
                 }
                 Err(_) => warn!("代理切换响应超时"),
             }
@@ -180,11 +223,7 @@ impl ServiceContext {
         self.do_rotate_proxy().await;
     }
 
-    /// 重置浏览器会话
-    pub async fn reset_browser(&self) {
-        self.session.clear();
-        debug!("浏览器会话已重置");
-    }
+
 
     /// 更新 Cookie
     pub fn update_cookies(&self, cookies: &str) {

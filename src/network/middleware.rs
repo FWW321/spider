@@ -134,9 +134,8 @@ impl Middleware for AntiBlockMiddleware {
         // 除非策略链已经拦截处理了，否则这里作为最后的防线处理 IP 封禁
         let final_status = current_resp.status();
         if final_status == StatusCode::FORBIDDEN || final_status == StatusCode::TOO_MANY_REQUESTS {
-            warn!("检测到 {}（策略未处理），正在切换代理并重置会话...", final_status);
-            ctx.rotate_proxy().await;
-            ctx.reset_browser().await;
+            warn!("检测到 {}（策略未处理），上报 RefreshRequired...", final_status);
+            // 纯粹的监测哨：发现封禁只管报错，具体的恢复（切IP、重试）交给上层引擎调度
             return Err(reqwest_middleware::Error::from(anyhow::Error::new(
                 SpiderError::RefreshRequired {
                     reason: format!("HTTP {}", final_status),
