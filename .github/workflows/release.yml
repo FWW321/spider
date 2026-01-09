@@ -48,6 +48,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download Browser Stealth Script
+        run: curl -L -o stealth.min.js https://raw.githubusercontent.com/requireCool/stealth.min.js/main/stealth.min.js
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
