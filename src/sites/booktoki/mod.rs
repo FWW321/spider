@@ -1,6 +1,4 @@
 //! Booktoki 站点模块
-//!
-//! 按照新架构拆分为多个子模块
 
 mod fetcher;
 mod indexer;
@@ -14,8 +12,9 @@ use url::Url;
 
 use crate::core::config::SiteConfig;
 use crate::core::error::Result;
-use crate::interfaces::site::TaskArgs;
-use crate::interfaces::{ContentFetcher, Indexer, NetworkPolicy, Site, SiteClient};
+use crate::core::model::{BookItem, Metadata};
+use crate::interfaces::site::{Context, TaskArgs};
+use crate::interfaces::{NetworkPolicy, Site, SiteClient};
 use crate::network::context::ServiceContext;
 use crate::network::policies::{CloudflarePolicy, RedirectPolicy};
 
@@ -69,7 +68,7 @@ impl Booktoki {
 
 #[async_trait]
 impl Site for Booktoki {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "booktoki"
     }
 
@@ -85,37 +84,48 @@ impl Site for Booktoki {
         &self.client
     }
 
-    fn indexer(&self) -> &dyn Indexer {
-        &self.indexer
+    async fn fetch_metadata(&self, ctx: &Context) -> Result<(Metadata, Option<TaskArgs>)> {
+        self.indexer.fetch_metadata(&ctx.args, self.client()).await
     }
 
-    fn fetcher(&self) -> &dyn ContentFetcher {
-        &self.fetcher
-    }
+    async fn fetch_chapter_list(&self, ctx: &Context) -> Result<Vec<BookItem>> {
+        let (mut items, mut next) = self.indexer.fetch_chapters(&ctx.args, self.client()).await?;
 
-    fn build_url(&self, kind: &str, args: &TaskArgs) -> Result<String> {
-        use crate::core::error::SpiderError;
-
-        match kind {
-            "metadata" | "chapters" => {
-                let id = args
-                    .get("id")
-                    .ok_or_else(|| SpiderError::Parse("Missing id".into()))?;
-                Ok(self.normalize(&format!("/novel/{}", id)))
-            }
-            _ => Err(SpiderError::Parse(format!("Unknown kind: {}", kind))),
+        // 处理分页
+        while let Some(url) = next {
+            tracing::debug!("Fetching next chapter page: {}", url);
+            let (more_items, next_url) = self
+                .indexer
+                .fetch_chapters_by_url(&url, self.client())
+                .await?;
+            items.extend(more_items);
+            next = next_url;
         }
+
+        Ok(items)
     }
 
-    async fn prepare(&self, _ctx: &ServiceContext) -> Result<()> {
+    async fn fetch_content(&self, _ctx: &Context, item: &BookItem) -> Result<String> {
+        let start_url = match item {
+            BookItem::Chapter(c) => &c.url,
+            _ => return Ok(String::new()),
+        };
+
+        let mut full_text = String::new();
+        let mut current_url = Some(start_url.to_string());
+
+        // 处理内容分页
+        while let Some(u) = current_url {
+            let (content, next) = self.fetcher.fetch_content(&u, self.client()).await?;
+            full_text.push_str(&content);
+            current_url = next;
+        }
+
+        Ok(full_text)
+    }
+
+    async fn prepare(&self, _ctx: &Context) -> Result<()> {
         tracing::info!("Booktoki 正在预热...");
-
-        // 使用站点客户端执行预热，自动处理反爬
-        // match self.client.get_text(self.base_url()).await {
-        //     Ok(_) => tracing::info!("Booktoki 预热成功"),
-        //     Err(e) => tracing::warn!("Booktoki 预热失败: {}", e),
-        // }
-
         Ok(())
     }
 }

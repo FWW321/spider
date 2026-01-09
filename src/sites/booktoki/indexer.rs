@@ -8,7 +8,6 @@ use url::Url;
 
 use crate::core::error::{Result, SpiderError};
 use crate::core::model::{BookItem, Chapter, Metadata};
-use crate::interfaces::Indexer;
 use crate::interfaces::site::TaskArgs;
 use crate::network::client::SiteClient;
 use crate::utils::to_absolute_url;
@@ -171,9 +170,8 @@ impl BooktokiIndexer {
     }
 }
 
-#[async_trait]
-impl Indexer for BooktokiIndexer {
-    async fn fetch_metadata(
+impl BooktokiIndexer {
+    pub async fn fetch_metadata(
         &self,
         args: &TaskArgs,
         client: &SiteClient,
@@ -184,7 +182,7 @@ impl Indexer for BooktokiIndexer {
         self.parse_metadata_html(&html)
     }
 
-    async fn fetch_chapters(
+    pub async fn fetch_chapters(
         &self,
         args: &TaskArgs,
         client: &SiteClient,
@@ -193,7 +191,7 @@ impl Indexer for BooktokiIndexer {
         self.fetch_chapters_by_url(&url, client).await
     }
 
-    async fn fetch_chapters_by_url(
+    pub async fn fetch_chapters_by_url(
         &self,
         url: &str,
         client: &SiteClient,

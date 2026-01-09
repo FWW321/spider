@@ -27,19 +27,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 directories = "6.0"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 epub-builder = "0.8"
 mime_guess = "2.0"
 booktoki_captcha = { git = "https://github.com/FWW321/booktoki_captcha.git", branch = "master" }
-blake3 = "1.8.2"
+blake3 = "1.8"
 parking_lot = "0.12"
 percent-encoding = "2.3.2"
 
-# New dependencies for refactoring
 indicatif = "0.18"
 strum = { version = "0.27", features = ["derive"] }
 strum_macros = "0.27"
-tokio-util = "0.7.17"
+tokio-util = "0.7"
 
 [[bin]]
 name = "spider"

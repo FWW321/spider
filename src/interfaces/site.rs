@@ -1,10 +1,12 @@
-//! 站点定义
+//! 站点接口定义
 //!
-//! 定义了站点需要实现的核心接口，包括索引器、内容获取器等。
+//! 定义了所有站点必须实现的统一接口
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use url::Url;
 
 use crate::core::config::SiteConfig;
 use crate::core::error::Result;
@@ -15,66 +17,32 @@ use crate::network::context::ServiceContext;
 /// 任务参数
 pub type TaskArgs = HashMap<String, String>;
 
-/// 索引器 Trait - 负责获取书籍元数据和章节列表
-#[async_trait]
-pub trait Indexer: Send + Sync {
-    /// 获取书籍元数据
-    async fn fetch_metadata(
-        &self,
-        args: &TaskArgs,
-        client: &SiteClient,
-    ) -> Result<(Metadata, Option<TaskArgs>)>;
-
-    /// 获取章节列表
-    async fn fetch_chapters(
-        &self,
-        args: &TaskArgs,
-        client: &SiteClient,
-    ) -> Result<(Vec<BookItem>, Option<String>)>;
-
-    /// 根据 URL 获取章节列表（用于分页）
-    async fn fetch_chapters_by_url(
-        &self,
-        url: &str,
-        client: &SiteClient,
-    ) -> Result<(Vec<BookItem>, Option<String>)>;
+/// 任务上下文 (Task Context)
+#[derive(Clone)]
+pub struct Context {
+    /// 任务唯一ID (通常是书籍ID，或者搜索关键词)
+    pub task_id: String,
+    /// 任务参数
+    pub args: TaskArgs,
+    /// 全局服务上下文 (提供事件、重试机制等)
+    pub core: ServiceContext,
 }
 
-/// 内容获取器 Trait - 负责获取章节内容
-#[async_trait]
-pub trait ContentFetcher: Send + Sync {
-    /// 获取章节内容
-    async fn fetch_content(
-        &self,
-        url: &str,
-        client: &SiteClient,
-    ) -> Result<(String, Option<String>)>;
-
-    /// 获取完整内容（自动处理分页）
-    async fn fetch_full_content(&self, url: &str, client: &SiteClient) -> Result<String> {
-        let mut full_text = String::new();
-        let mut current_url = Some(url.to_string());
-
-        while let Some(u) = current_url {
-            let (content, next) = self.fetch_content(&u, client).await?;
-            full_text.push_str(&content);
-            current_url = next;
+impl Context {
+    pub fn new(task_id: String, args: TaskArgs, core: ServiceContext) -> Self {
+        Self {
+            task_id,
+            args,
+            core,
         }
-
-        Ok(full_text)
     }
 }
 
 /// 站点定义 Trait
-///
-/// 每个站点需要实现此 Trait，提供：
-/// - 站点标识和配置
-/// - 客户端（封装了策略链）
-/// - 索引器和内容获取器
 #[async_trait]
 pub trait Site: Send + Sync {
     /// 站点唯一标识
-    fn id(&self) -> &str;
+    fn id(&self) -> &'static str;
 
     /// 站点配置
     fn config(&self) -> &SiteConfig;
@@ -82,21 +50,95 @@ pub trait Site: Send + Sync {
     /// 基础 URL
     fn base_url(&self) -> &str;
 
-    /// 获取站点专用客户端
+    /// 获取站点专用客户端 (包含特定的策略链)
     fn client(&self) -> &SiteClient;
 
-    /// 获取索引器
-    fn indexer(&self) -> &dyn Indexer;
+    /// 获取元数据
+    ///
+    /// 返回元数据和可选的新参数(用于参数发现，如 slug -> id)
+    async fn fetch_metadata(&self, ctx: &Context) -> Result<(Metadata, Option<TaskArgs>)>;
 
-    /// 获取内容获取器
-    fn fetcher(&self) -> &dyn ContentFetcher;
+    /// 获取章节列表
+    ///
+    /// 必须返回完整的章节列表 (如果站点分页，需在此方法内处理完分页逻辑)
+    async fn fetch_chapter_list(&self, ctx: &Context) -> Result<Vec<BookItem>>;
 
-    /// 预准备钩子（可选）
-    /// 在 Pipeline 初始化之前调用，用于预登录、获取初始 Cookie 等
-    async fn prepare(&self, _ctx: &ServiceContext) -> Result<()> {
+    /// 获取章节内容
+    ///
+    /// 返回完整的章节正文 (如果章节内部分页，需在此方法内处理合并)
+    async fn fetch_content(&self, ctx: &Context, chapter_item: &BookItem) -> Result<String>;
+
+    /// 站点预热 (可选)
+    /// 用于登录、获取初始 Cookie 或 CSRF Token
+    async fn prepare(&self, _ctx: &Context) -> Result<()> {
         Ok(())
     }
 
-    /// 构建 URL
-    fn build_url(&self, kind: &str, args: &TaskArgs) -> Result<String>;
+    /// 图片处理与提取 (可选，提供默认实现)
+    ///
+    /// 输入 HTML，输出 (处理后的HTML, 提取的图片URL列表)
+    /// 默认实现会将 img src 替换为相对路径 "../Images/xxx"
+    fn process_images(&self, html: &str) -> (String, Vec<String>) {
+        use crate::utils::{generate_filename, to_absolute_url};
+        use scraper::{Html, Selector};
+
+        let document = Html::parse_document(html);
+        let selector = match Selector::parse("img") {
+            Ok(s) => s,
+            Err(_) => return (html.to_string(), vec![]),
+        };
+
+        let mut images = Vec::new();
+        let mut new_html = html.to_string();
+        let base = Url::parse(self.base_url()).ok();
+
+        for element in document.select(&selector) {
+            let Some(src) = element.value().attr("src") else {
+                continue;
+            };
+            if src.trim().is_empty() {
+                continue;
+            }
+
+            // 1. 检查是否已处理 (避免重复处理)
+            if let Some(original_url) = element.value().attr("data-original-url") {
+                images.push(original_url.to_string());
+                continue;
+            }
+
+            // 2. 转绝对路径
+            let absolute_url = base
+                .as_ref()
+                .map(|b| to_absolute_url(b, src))
+                .unwrap_or_else(|| src.to_string());
+
+            images.push(absolute_url.clone());
+
+            // 3. 生成本地路径
+            let filename = generate_filename(&absolute_url);
+            let local_path = format!("../Images/{}", filename);
+            let old_tag = element.html();
+
+            // 4. 替换标签 (保留原始URL)
+            let new_tag = old_tag
+                .replacen(
+                    &format!("src=\"{}\"", src),
+                    &format!(
+                        "src=\"{}\" data-original-url=\"{}\"",
+                        local_path,
+                        absolute_url
+                    ),
+                    1,
+                )
+                .replacen(
+                    &format!("src='{}'", src),
+                    &format!("src='{}' data-original-url='{}'", local_path, absolute_url),
+                    1,
+                );
+
+            new_html = new_html.replace(&old_tag, &new_tag);
+        }
+
+        (new_html, images)
+    }
 }

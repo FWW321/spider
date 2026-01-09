@@ -7,7 +7,6 @@ use scraper::{Html, Selector};
 use url::Url;
 
 use crate::core::error::{Result, SpiderError};
-use crate::interfaces::ContentFetcher;
 use crate::network::client::SiteClient;
 use super::SiteSelectors;
 
@@ -22,9 +21,8 @@ impl BooktokiFetcher {
     }
 }
 
-#[async_trait]
-impl ContentFetcher for BooktokiFetcher {
-    async fn fetch_content(
+impl BooktokiFetcher {
+    pub async fn fetch_content(
         &self,
         url: &str,
         client: &SiteClient,
