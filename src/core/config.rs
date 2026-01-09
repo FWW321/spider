@@ -70,7 +70,7 @@ pub struct SpiderConfig {
 /// 站点特定配置覆盖
 #[derive(Debug, Deserialize, Builder, Clone, Default)]
 pub struct SiteConfig {
-    /// 自定义域名 (用于私有部署或镜像站点)
+    /// 自定义域名
     pub base_url: Option<String>,
     /// 站点独占任务并行度
     pub concurrent_tasks: Option<usize>,
