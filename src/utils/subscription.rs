@@ -519,14 +519,12 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
     let hash = blake3::hash(urls.join(",").as_bytes()).to_hex().to_string();
     let cache_file = cache_path.join("sub_cache.json");
 
-    if let Ok(data) = tokio::fs::read_to_string(&cache_file).await {
-        if let Ok(cache) = serde_json::from_str::<Cache>(&data) {
-            if cache.hash == hash {
+    if let Ok(data) = tokio::fs::read_to_string(&cache_file).await
+        && let Ok(cache) = serde_json::from_str::<Cache>(&data)
+            && cache.hash == hash {
                 debug!("订阅缓存命中: {} 个节点", cache.nodes.len());
                 return Ok(cache.nodes);
             }
-        }
-    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
@@ -606,7 +604,7 @@ pub fn generate_singbox_config(
     }
 
     let node_tags: Vec<String> = nodes.iter().map(|n| n.tag().to_string()).collect();
-    
+
     let mut outbound_list = vec![
         json!({ "type": "direct", "tag": "direct" }),
         json!({
@@ -630,7 +628,7 @@ pub fn generate_singbox_config(
             "final": "dns-local"
         },
         "inbounds": [{
-            "type": "http", "tag": "proxy-in", "listen": "127.0.0.1", "listen_port": proxy_port
+            "type": "mixed", "tag": "proxy-in", "listen": "127.0.0.1", "listen_port": proxy_port
         }],
         "outbounds": outbound_list,
         "route": {

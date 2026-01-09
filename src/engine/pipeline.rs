@@ -1,35 +1,52 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::Arc;
+//! 爬虫引擎
+//!
+//! 支持策略链和事件系统的新架构引擎
 
-use scraper::{Html, Selector};
+use std::collections::HashSet;
+use std::path::{PathBuf, Path};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 use crate::core::config::AppConfig;
 use crate::core::error::{Result, SpiderError};
+use crate::core::event::{EventSender, SpiderEvent};
 use crate::core::model::{Book, BookItem, Chapter};
-use crate::engine::client::SiteClient;
-use crate::sites::{Site, SiteContext, TaskArgs};
-use crate::utils::{file_exists, generate_filename, save_file, to_absolute_url};
+use crate::interfaces::Site;
+use crate::interfaces::site::TaskArgs;
+use crate::network::context::ServiceContext;
+use crate::utils::{file_exists, generate_filename, save_file};
 
-// ============================================================================
-// Task System
-// ============================================================================
+// =============================================================================
+// 任务上下文
+// =============================================================================
 
 struct ScrapeContext {
-    client: Arc<SiteClient>,
+    site: Arc<dyn Site>,
+    ctx: ServiceContext,
     semaphore: Arc<Semaphore>,
     images_dir: PathBuf,
     total_chapters: usize,
+    completed_chapters: Arc<AtomicUsize>,
+    events: Option<EventSender>,
+}
+
+impl ScrapeContext {
+    /// 发送事件
+    fn emit(&self, event: SpiderEvent) {
+        if let Some(ref sender) = self.events {
+            sender.emit(event);
+        }
+    }
 }
 
 enum Task {
     Cover { url: String, path: PathBuf },
     Chapter { chapter: Chapter, path: PathBuf },
-    Image { url: String, path: PathBuf },
+    Image { url: String, path: PathBuf, source: String },
 }
 
 impl Task {
@@ -42,7 +59,7 @@ impl Task {
 
         match self {
             Task::Cover { url, path } => Self::handle_cover(url, path, &ctx).await,
-            Task::Image { url, path } => Self::handle_image(url, path, &ctx).await,
+            Task::Image { url, path, source } => Self::handle_image(url, path, source, &ctx).await,
             Task::Chapter { chapter, path } => Self::handle_chapter(chapter, path, &ctx).await,
         }
     }
@@ -52,23 +69,44 @@ impl Task {
             return Ok(vec![]);
         }
 
-        let bytes = ctx.client.fetch_bytes(&url).await?;
+        let bytes = ctx
+            .ctx
+            .run_optimistic("下载封面", || {
+                let url = url.clone();
+                let site = ctx.site.clone();
+                async move { site.client().get_bytes(&url).await }
+            })
+            .await?;
+
         save_file(&path, &bytes).await?;
-        debug!("封面下载完成");
+
+        ctx.emit(SpiderEvent::CoverDownloaded);
+        info!("封面下载完成");
+
         Ok(vec![])
     }
 
-    async fn handle_image(url: String, path: PathBuf, ctx: &ScrapeContext) -> Result<Vec<Task>> {
+    async fn handle_image(url: String, path: PathBuf, source: String, ctx: &ScrapeContext) -> Result<Vec<Task>> {
         if file_exists(&path).await {
             return Ok(vec![]);
         }
 
-        match ctx.client.fetch_bytes(&url).await {
+        match ctx
+            .ctx
+            .run_optimistic(format!("下载图片: {}", url), || {
+                let url = url.clone();
+                let site = ctx.site.clone();
+                async move { site.client().get_bytes(&url).await }
+            })
+            .await
+        {
             Ok(bytes) => {
                 save_file(&path, &bytes).await?;
-                debug!("图片已保存: {}", url);
+                info!("图片已保存 [{}] : {}", source, url);
             }
-            Err(e) => warn!("图片下载失败: {}", e),
+            Err(e) => {
+                warn!("图片下载失败 [{}]: {}", source, e);
+            }
         }
         Ok(vec![])
     }
@@ -78,26 +116,60 @@ impl Task {
         path: PathBuf,
         ctx: &ScrapeContext,
     ) -> Result<Vec<Task>> {
-        if let Ok(html) = tokio::fs::read_to_string(&path).await {
-            if !html.is_empty() {
+        // 检查缓存
+        if let Ok(html) = tokio::fs::read_to_string(&path).await
+            && !html.is_empty() {
                 debug!("跳过已存在章节: {}", chapter.title);
+
+                // 更新进度
+                let completed = ctx.completed_chapters.fetch_add(1, Ordering::SeqCst) + 1;
+                ctx.emit(SpiderEvent::ChapterProgress {
+                    current: completed,
+                    total: ctx.total_chapters,
+                    title: chapter.title.clone(),
+                });
+
                 return Ok(Self::parse_images_from_html(
                     &html,
                     &chapter.url,
                     &ctx.images_dir,
+                    format!("章节: {}", chapter.title),
                 ));
-            } else {
-                debug!("本地章节文件存在但为空: {}, 将重新下载", chapter.title);
             }
-        }
 
-        let raw_html = ctx.client.fetch_full_content(&chapter.url).await?;
+        // 获取内容（使用 run_optimistic 自动重试）
+        let raw_html = ctx
+            .ctx
+            .run_optimistic(format!("下载章节: {}", chapter.title), || {
+                let url = chapter.url.clone();
+                let site = ctx.site.clone();
+                async move {
+                    site.fetcher()
+                        .fetch_full_content(&url, site.client())
+                        .await
+                }
+            })
+            .await?;
+
         let (processed_content, image_urls) =
             ScrapeEngine::process_content(&raw_html, &chapter.url);
 
         save_file(&path, processed_content.as_bytes()).await?;
+
+        // 更新进度
+        let completed = ctx.completed_chapters.fetch_add(1, Ordering::SeqCst) + 1;
+        ctx.emit(SpiderEvent::ChapterProgress {
+            current: completed,
+            total: ctx.total_chapters,
+            title: chapter.title.clone(),
+        });
+        ctx.emit(SpiderEvent::ChapterCompleted {
+            index: chapter.index as usize,
+            title: chapter.title.clone(),
+        });
+
         info!(
-            "[{}/{}] {}",
+            "[/{}/{}] {}",
             chapter.index, ctx.total_chapters, chapter.title
         );
 
@@ -108,12 +180,13 @@ impl Task {
                 Task::Image {
                     url,
                     path: ctx.images_dir.join(filename),
+                    source: format!("章节: {}", chapter.title),
                 }
             })
             .collect())
     }
 
-    fn parse_images_from_html(html: &str, base_url: &str, images_dir: &PathBuf) -> Vec<Task> {
+    fn parse_images_from_html(html: &str, base_url: &str, images_dir: &Path, source: String) -> Vec<Task> {
         let (_, images) = ScrapeEngine::process_content(html, base_url);
         images
             .into_iter()
@@ -122,115 +195,158 @@ impl Task {
                 Task::Image {
                     url,
                     path: images_dir.join(filename),
+                    source: source.clone(),
                 }
             })
             .collect()
     }
 }
 
-// ============================================================================
-// Scrape Engine
-// ============================================================================
+// =============================================================================
+// 爬虫引擎
+// =============================================================================
 
+/// 爬虫引擎
 pub struct ScrapeEngine {
-    client: Arc<SiteClient>,
+    site: Arc<dyn Site>,
+    ctx: ServiceContext,
     config: Arc<AppConfig>,
 }
 
 impl ScrapeEngine {
-    pub fn new(site: Arc<dyn Site>, ctx: SiteContext, config: Arc<AppConfig>) -> Self {
-        Self {
-            client: Arc::new(SiteClient::new(site, ctx)),
-            config,
-        }
+    /// 创建新的爬虫引擎
+    pub fn new(site: Arc<dyn Site>, ctx: ServiceContext, config: Arc<AppConfig>) -> Self {
+        Self { site, ctx, config }
     }
 
     /// 执行抓取流程
     pub async fn run(&self, mut args: TaskArgs) -> Result<()> {
-        let book = self.prepare_book(&mut args).await?;
+        let run_inner = async {
+            // 调用站点预热钩子
+            if let Err(e) = self.site.prepare(&self.ctx).await {
+                warn!("站点预热失败: {}", e);
+            }
 
-        let text_dir = book.text_dir().await;
-        let cover_dir = book.cover_dir().await;
-        let images_dir = book.images_dir().await;
+            let book = self.prepare_book(&mut args).await?;
 
-        let chapters: Vec<_> = book.chapters().collect();
-        let total_chapters = chapters.len();
-        info!("共发现 {} 个章节", total_chapters);
+            // 发送任务开始事件
+            self.ctx.emit(SpiderEvent::TaskStarted {
+                site_id: self.site.id().to_string(),
+                book_id: book.id.clone(),
+                title: book.metadata.title.clone(),
+            });
 
-        let concurrency = self
-            .client
-            .site
-            .config()
-            .concurrent_tasks
-            .unwrap_or(self.config.spider.concurrency);
+            let text_dir = book.text_dir().await;
+            let cover_dir = book.cover_dir().await;
+            let images_dir = book.images_dir().await;
 
-        let ctx = Arc::new(ScrapeContext {
-            client: self.client.clone(),
-            semaphore: Arc::new(Semaphore::new(concurrency)),
-            images_dir: images_dir.clone(),
-            total_chapters,
-        });
+            let chapters: Vec<_> = book.chapters().collect();
+            let total_chapters = chapters.len();
 
-        let mut join_set = JoinSet::new();
-        let mut seen_images = HashSet::new();
+            // 发送章节发现事件
+            self.ctx.emit(SpiderEvent::ChaptersDiscovered {
+                total: total_chapters,
+            });
 
-        self.seed_cover_task(&mut join_set, &book, &cover_dir, &ctx);
-        self.seed_volume_covers(&mut join_set, &mut seen_images, &book, &images_dir, &ctx);
-        self.seed_chapter_tasks(&mut join_set, chapters, &text_dir, &ctx);
+            info!("共发现 {} 个章节", total_chapters);
 
-        while let Some(res) = join_set.join_next().await {
-            let result = match res {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("并发调度错误: {}", e);
-                    continue;
-                }
-            };
+            let concurrency = self
+                .site
+                .config()
+                .concurrent_tasks
+                .unwrap_or(self.config.spider.concurrency);
 
-            let new_tasks = match result {
-                Ok(tasks) => tasks,
-                Err(e) => {
-                    error!("任务执行失败: {}", e);
-                    continue;
-                }
-            };
+            let scrape_ctx = Arc::new(ScrapeContext {
+                site: self.site.clone(),
+                ctx: self.ctx.clone(),
+                semaphore: Arc::new(Semaphore::new(concurrency)),
+                images_dir: images_dir.clone(),
+                total_chapters,
+                completed_chapters: Arc::new(AtomicUsize::new(0)),
+                events: self.ctx.events.clone(),
+            });
 
-            for task in new_tasks {
-                if let Task::Image { ref url, .. } = task {
-                    if !seen_images.insert(url.clone()) {
+            let mut join_set = JoinSet::new();
+            let mut seen_images = HashSet::new();
+
+            self.seed_cover_task(&mut join_set, &book, &cover_dir, &scrape_ctx);
+            self.seed_volume_covers(
+                &mut join_set,
+                &mut seen_images,
+                &book,
+                &images_dir,
+                &scrape_ctx,
+            );
+            self.seed_chapter_tasks(&mut join_set, chapters, &text_dir, &scrape_ctx);
+
+            while let Some(res) = join_set.join_next().await {
+                let result = match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("并发调度错误: {}", e);
                         continue;
                     }
-                }
+                };
 
-                join_set.spawn(task.run(ctx.clone()));
+                let new_tasks = match result {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
+                        error!("任务执行失败: {}", e);
+                        continue;
+                    }
+                };
+
+                for task in new_tasks {
+                    if let Task::Image { ref url, .. } = task
+                        && !seen_images.insert(url.clone()) {
+                            continue;
+                        }
+
+                    join_set.spawn(task.run(scrape_ctx.clone()));
+                }
+            }
+
+            info!("采集任务已完成: {}", book.metadata.title);
+
+            self.generate_epub(book).await?;
+
+            // 发送任务完成事件
+            self.ctx.emit(SpiderEvent::TaskCompleted {
+                title: self.site.id().to_string(),
+            });
+
+            Ok::<(), SpiderError>(())
+        };
+
+        match run_inner.await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("任务执行失败: {}", e);
+                self.ctx.emit(SpiderEvent::TaskFailed {
+                    error: e.to_string(),
+                });
+                Err(e)
             }
         }
-
-        info!("采集任务已完成: {}", book.metadata.title);
-
-        self.generate_epub(book).await?;
-
-        Ok(())
     }
 
     fn seed_cover_task(
         &self,
         set: &mut JoinSet<Result<Vec<Task>>>,
         book: &Book,
-        dir: &PathBuf,
+        dir: &Path,
         ctx: &Arc<ScrapeContext>,
     ) {
         if let Some(url) = &book.metadata.cover_url
-            && let Some(filename) = book.metadata.cover_filename()
-        {
-            set.spawn(
-                Task::Cover {
-                    url: url.clone(),
-                    path: dir.join(filename),
-                }
-                .run(ctx.clone()),
-            );
-        }
+            && let Some(filename) = book.metadata.cover_filename() {
+                set.spawn(
+                    Task::Cover {
+                        url: url.clone(),
+                        path: dir.join(filename),
+                    }
+                    .run(ctx.clone()),
+                );
+            }
     }
 
     fn seed_volume_covers(
@@ -238,23 +354,23 @@ impl ScrapeEngine {
         set: &mut JoinSet<Result<Vec<Task>>>,
         seen: &mut HashSet<String>,
         book: &Book,
-        dir: &PathBuf,
+        dir: &Path,
         ctx: &Arc<ScrapeContext>,
     ) {
         for item in &book.items {
             if let BookItem::Volume(vol) = item
                 && let Some(url) = &vol.cover_url
-                && let Some(filename) = vol.cover_filename()
-                && seen.insert(url.clone())
-            {
-                set.spawn(
-                    Task::Image {
-                        url: url.clone(),
-                        path: dir.join(filename),
-                    }
-                    .run(ctx.clone()),
-                );
-            }
+                    && let Some(filename) = vol.cover_filename()
+                        && seen.insert(url.clone()) {
+                            set.spawn(
+                                Task::Image {
+                                    url: url.clone(),
+                                    path: dir.join(filename),
+                                    source: format!("卷封面: {}", vol.title),
+                                }
+                                .run(ctx.clone()),
+                            );
+                        }
         }
     }
 
@@ -262,7 +378,7 @@ impl ScrapeEngine {
         &self,
         set: &mut JoinSet<Result<Vec<Task>>>,
         chapters: Vec<Chapter>,
-        dir: &PathBuf,
+        dir: &Path,
         ctx: &Arc<ScrapeContext>,
     ) {
         for chapter in chapters {
@@ -277,12 +393,17 @@ impl ScrapeEngine {
     }
 
     async fn generate_epub(&self, book: Book) -> Result<()> {
+        self.ctx.emit(SpiderEvent::EpubGenerating);
         info!("正在生成 EPUB 文件...");
+
         let generator = crate::core::epub::EpubGenerator::new(book.clone());
         let output_path = book.base_dir.join(format!("{}.epub", book.unique_id()));
 
-        match generator.run(Some(output_path)).await {
+        match generator.run(Some(&output_path)).await {
             Ok(path) => {
+                self.ctx.emit(SpiderEvent::EpubGenerated {
+                    path: path.display().to_string(),
+                });
                 info!("EPUB 生成成功: {:?}", path);
                 Ok(())
             }
@@ -295,7 +416,15 @@ impl ScrapeEngine {
 
     async fn prepare_book(&self, args: &mut TaskArgs) -> Result<Book> {
         debug!("正在获取元数据...");
-        let (metadata, discovered_args) = self.client.fetch_metadata(args).await?;
+        let (metadata, discovered_args) = self
+            .ctx
+            .run_optimistic("获取元数据", || {
+                let args = args.clone();
+                let site = self.site.clone();
+                async move { site.indexer().fetch_metadata(&args, site.client()).await }
+            })
+            .await?;
+
         if let Some(new_args) = discovered_args {
             args.extend(new_args);
         }
@@ -305,7 +434,7 @@ impl ScrapeEngine {
         items.sort_by_key(|item| item.index());
 
         Ok(Book::new(
-            self.client.site.id().to_string(),
+            self.site.id().to_string(),
             self.get_id(args),
             metadata,
             items,
@@ -319,14 +448,35 @@ impl ScrapeEngine {
         let mut is_first = true;
 
         loop {
-            let (items, next) = if is_first {
-                is_first = false;
-                self.client.fetch_chapters(args).await?
-            } else if let Some(url) = next_url {
-                self.client.fetch_chapters_by_url(&url).await?
-            } else {
+            if !is_first && next_url.is_none() {
                 break;
-            };
+            }
+
+            let (items, next) = self
+                .ctx
+                .run_optimistic("获取章节列表", || {
+                    let args = args.clone();
+                    let next_url = next_url.clone();
+                    let is_first_run = is_first;
+                    let site = self.site.clone();
+
+                    async move {
+                        if is_first_run {
+                            site.indexer().fetch_chapters(&args, site.client()).await
+                        } else if let Some(ref url) = next_url {
+                            site.indexer()
+                                .fetch_chapters_by_url(url, site.client())
+                                .await
+                        } else {
+                            unreachable!("Should have broken loop if next_url is None");
+                        }
+                    }
+                })
+                .await?;
+
+            if is_first {
+                is_first = false;
+            }
 
             all_items.extend(items);
             next_url = next;
@@ -341,7 +491,11 @@ impl ScrapeEngine {
     }
 
     /// 处理 HTML 内容：提取图片 URL 并替换为本地路径
-    fn process_content(html: &str, base_url: &str) -> (String, Vec<String>) {
+    pub fn process_content(html: &str, base_url: &str) -> (String, Vec<String>) {
+        use crate::utils::{generate_filename, to_absolute_url};
+        use scraper::{Html, Selector};
+        use url::Url;
+
         let document = Html::parse_document(html);
         let selector = Selector::parse("img").unwrap();
 

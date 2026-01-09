@@ -11,6 +11,16 @@ pub enum SpiderError {
     #[error("Browser error: {0}")]
     Browser(String),
 
+    /// 需要刷新客户端并完全重启请求 (例如 CF 绕过或代理切换后)
+    #[error("Refresh required: {reason}")]
+    RefreshRequired {
+        reason: String,
+        new_url: Option<String>,
+    },
+
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

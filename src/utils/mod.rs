@@ -3,7 +3,6 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
-pub mod browser;
 pub mod singbox;
 pub mod subscription;
 

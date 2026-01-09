@@ -1,55 +1,19 @@
 use std::sync::Arc;
+use reqwest::{Request, Response, StatusCode};
+use reqwest_middleware::{Middleware, Next, Result};
+use tracing::warn;
 
-use flume::Sender;
-use http::{Extensions, HeaderValue, Method};
-use reqwest::{Request, Response, StatusCode, Url, header};
-use reqwest_middleware::{Error, Middleware, Next, Result};
-use tracing::{debug, info, warn};
-
-use crate::actors::proxy::ProxyMsg;
+use crate::interfaces::policy::PolicyResult;
+use crate::interfaces::NetworkPolicy;
+use crate::network::context::ServiceContext;
 use crate::core::error::SpiderError;
-use crate::network::session::Session;
-use crate::sites::MiddlewareContext;
 
-/// 标记结构体，用于在请求扩展中指示跳过阻断检测逻辑
+/// 跳过反爬逻辑标记
 #[derive(Clone)]
 pub struct SkipAntiBlock;
 
-/// 保存原始请求URL，用于重定向后的重试
-#[derive(Clone)]
-pub struct OriginalUrl(pub String);
-
-#[derive(Clone, Default)]
-struct RedirectCount(u8);
-
-#[derive(Clone, Default)]
-struct RecoveryAttempts(u8);
-
-const MAX_REDIRECTS: u8 = 10;
-const MAX_RECOVERY_ATTEMPTS: u8 = 3;
-
-// --- ProxyMiddleware ---
-
-pub struct ProxyMiddleware {
-    pub proxy_actor: Sender<ProxyMsg>,
-}
-
-#[async_trait::async_trait]
-impl Middleware for ProxyMiddleware {
-    async fn handle(&self, req: Request, ext: &mut Extensions, next: Next<'_>) -> Result<Response> {
-        let res = next.run(req, ext).await;
-
-        if let Err(e) = &res {
-            if matches!(e, Error::Reqwest(e) if e.is_timeout() || e.is_connect()) {
-                let _ = self.proxy_actor.send(ProxyMsg::Rotate { reply: None });
-            }
-        }
-        res
-    }
-}
-
-// --- SessionMiddleware ---
-
+/// 会话注入中间件
+/// 负责在每次请求前，动态将 Session 中的最新 Cookie/UA 注入 Header
 pub struct SessionMiddleware;
 
 #[async_trait::async_trait]
@@ -57,163 +21,118 @@ impl Middleware for SessionMiddleware {
     async fn handle(
         &self,
         mut req: Request,
-        ext: &mut Extensions,
+        extensions: &mut http::Extensions,
         next: Next<'_>,
     ) -> Result<Response> {
-        if let Some(session) = ext.get::<Arc<Session>>() {
-            let ua = session.ua.read();
-            if !ua.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(&ua) {
-                    req.headers_mut().insert(header::USER_AGENT, val);
-                }
-            }
+        if let Some(session) = extensions.get::<std::sync::Arc<crate::network::session::Session>>() {
+            let headers = req.headers_mut();
 
-            let cookie = session.cookie.read();
-            if let Some(c) = &*cookie {
-                debug!("注入 Session Cookie (长度: {})", c.len());
-                if let Ok(val) = HeaderValue::from_str(c) {
-                    req.headers_mut().insert(header::COOKIE, val);
+            // 动态注入 UA
+            let ua = session.get_ua();
+            if !ua.is_empty()
+                && let Ok(val) = reqwest::header::HeaderValue::from_str(&ua) {
+                    headers.insert(reqwest::header::USER_AGENT, val);
                 }
-            }
 
-            let extra = session.extra_headers.read();
+            // 动态注入 Cookie
+            if let Some(cookie) = session.get_cookie()
+                && !cookie.is_empty()
+                    && let Ok(val) = reqwest::header::HeaderValue::from_str(&cookie) {
+                        headers.insert(reqwest::header::COOKIE, val);
+                    }
+
+            // 动态注入其他 Headers
+            let extra = session.get_headers();
             for (k, v) in extra.iter() {
-                req.headers_mut().insert(k.clone(), v.clone());
+                headers.insert(k.clone(), v.clone());
             }
         }
-        next.run(req, ext).await
+        next.run(req, extensions).await
     }
 }
 
-// --- AntiBlockMiddleware ---
-
+/// 反爬中间件
+/// 负责：1. 乐观锁等待  2. 运行策略检查并按需抛出 RefreshRequired
 pub struct AntiBlockMiddleware;
-
-impl AntiBlockMiddleware {
-    fn resolve_redirect_url(base_url: &Url, res: &Response) -> Option<Url> {
-        let loc = res.headers().get(header::LOCATION)?;
-
-        let loc_str = String::from_utf8_lossy(loc.as_bytes());
-
-        base_url.join(&loc_str).ok()
-    }
-
-    fn should_check_block(status: StatusCode, res: &Response) -> bool {
-        if status.as_u16() >= 400 && status != StatusCode::NOT_FOUND {
-            return true;
-        }
-        res.headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map_or(false, |s| s.contains("text/html"))
-    }
-}
 
 #[async_trait::async_trait]
 impl Middleware for AntiBlockMiddleware {
-    async fn handle(&self, req: Request, ext: &mut Extensions, next: Next<'_>) -> Result<Response> {
-        let skip_recover = ext.get::<SkipAntiBlock>().is_some();
-        if ext.get::<OriginalUrl>().is_none() {
-            ext.insert(OriginalUrl(req.url().to_string()));
+    async fn handle(
+        &self,
+        req: Request,
+        extensions: &mut http::Extensions,
+        next: Next<'_>,
+    ) -> Result<Response> {
+        if extensions.get::<SkipAntiBlock>().is_some() {
+            return next.run(req, extensions).await;
         }
 
-        let current_referer = req.url().to_string();
-        let res = next.clone().run(req, ext).await?;
-        let status = res.status();
-        let current_url = res.url().clone();
+        let ctx = extensions
+            .get::<ServiceContext>()
+            .expect("ServiceContext missing")
+            .clone();
 
-        debug!("响应状态: {} ({})", status.as_u16(), current_url);
+        let policies = extensions
+            .get::<Vec<Arc<dyn NetworkPolicy>>>()
+            .cloned()
+            .unwrap_or_default();
 
-        if status.is_redirection() {
-            if let Some(target_url) = Self::resolve_redirect_url(&current_url, &res) {
-                let redirect_count = ext.get::<RedirectCount>().map(|r| r.0).unwrap_or(0);
+        let resp = next.run(req, extensions).await?;
 
-                if redirect_count >= MAX_REDIRECTS {
-                    warn!("达到最大重定向次数 ({})", MAX_REDIRECTS);
-                    return Ok(res);
+        // 先运行站点策略链（Cloudflare、Captcha 等需要精确检测）
+        let mut current_resp = resp;
+        for policy in &policies {
+            match policy.check(current_resp, &ctx).await {
+                Ok(PolicyResult::Pass(r)) => {
+                    current_resp = r;
                 }
-
-                debug!("跟随重定向: {} -> {}", status, target_url);
-                ext.insert(RedirectCount(redirect_count + 1));
-
-                let mut new_req = Request::new(Method::GET, target_url);
-                new_req.headers_mut().insert(
-                    header::REFERER,
-                    HeaderValue::from_str(&current_referer).unwrap(),
-                );
-
-                return Box::pin(self.handle(new_req, ext, next)).await;
+                Ok(PolicyResult::Retry { is_force, reason }) => {
+                    if is_force {
+                        // 强制重试：抛出中断信号，让顶层 HttpService 换个 Client 重新来过
+                        return Err(reqwest_middleware::Error::from(anyhow::Error::new(
+                            SpiderError::RefreshRequired {
+                                reason,
+                                new_url: None,
+                            }
+                        )));
+                    } else {
+                        // 普通重试：暂时也可以抛出，让顶层统一处理
+                        return Err(reqwest_middleware::Error::from(anyhow::Error::new(
+                            SpiderError::RefreshRequired {
+                                reason: format!("Policy retry: {}", reason),
+                                new_url: None,
+                            }
+                        )));
+                    }
+                }
+                Ok(PolicyResult::Redirect(url)) => {
+                    warn!("检测到重定向: {}", url);
+                    return Err(reqwest_middleware::Error::from(anyhow::Error::new(
+                        SpiderError::RefreshRequired {
+                            reason: "redirect".into(),
+                            new_url: Some(url),
+                        }
+                    )));
+                }
+                Ok(PolicyResult::Fail(e)) => return Err(reqwest_middleware::Error::from(anyhow::Error::new(e))),
+                Err(e) => return Err(reqwest_middleware::Error::from(anyhow::Error::new(e))),
             }
         }
 
-        if skip_recover || !Self::should_check_block(status, &res) {
-            return Ok(res);
+        // 策略链都通过了，再检查是否是通用的 403/429（真正的 IP 封禁）
+        let final_status = current_resp.status();
+        if final_status == StatusCode::FORBIDDEN || final_status == StatusCode::TOO_MANY_REQUESTS {
+            warn!("检测到 {}（策略未处理），正在切换代理并重置会话...", final_status);
+            ctx.rotate_proxy().await;
+            ctx.reset_browser().await;
+            return Err(reqwest_middleware::Error::from(anyhow::Error::new(
+                SpiderError::RefreshRequired {
+                    reason: format!("HTTP {}", final_status),
+                    new_url: None,
+                }
+            )));
         }
 
-        let Some(mw_ctx) = ext.get::<Arc<MiddlewareContext>>() else {
-            return Ok(res);
-        };
-
-        let headers = res.headers().clone();
-        let version = res.version();
-
-        let bytes = res.bytes().await.map_err(reqwest_middleware::Error::from)?;
-        let html = String::from_utf8_lossy(&bytes);
-
-        if let Err(SpiderError::SoftBlock(reason)) =
-            mw_ctx
-                .site
-                .check_block(current_url.as_str(), &html, status.as_u16())
-        {
-            let original_url_str = ext
-                .get::<OriginalUrl>()
-                .map(|u| u.0.clone())
-                .unwrap_or_else(|| current_url.to_string());
-            let attempts = ext.get::<RecoveryAttempts>().map(|r| r.0).unwrap_or(0);
-
-            if attempts >= MAX_RECOVERY_ATTEMPTS {
-                warn!(
-                    "达到最大阻断恢复重试次数 ({}): {}",
-                    MAX_RECOVERY_ATTEMPTS, original_url_str
-                );
-                return Err(reqwest_middleware::Error::from(anyhow::anyhow!(
-                    SpiderError::SoftBlock(format!("{}:max_retries_exceeded", reason))
-                )));
-            }
-
-            warn!(
-                "检测到访问阻断，正在重试 ({}/{})",
-                attempts + 1,
-                MAX_RECOVERY_ATTEMPTS
-            );
-            debug!("阻断详情: {} -> {}", original_url_str, reason);
-
-            let recovered = mw_ctx
-                .site
-                .recover(&original_url_str, &reason, &mw_ctx.ctx)
-                .await
-                .map_err(|e| reqwest_middleware::Error::from(anyhow::anyhow!(e)))?;
-
-            if recovered {
-                info!("访问阻断已解除，继续执行任务...");
-                debug!("重试目标: {}", original_url_str);
-
-                ext.insert(RedirectCount(0));
-                ext.insert(RecoveryAttempts(attempts + 1));
-
-                let new_req = Request::new(Method::GET, original_url_str.parse().unwrap());
-                return Box::pin(self.handle(new_req, ext, next)).await;
-            }
-        }
-
-        let mut builder = http::Response::builder().status(status).version(version);
-
-        if let Some(h_map) = builder.headers_mut() {
-            *h_map = headers;
-        }
-
-        let response = builder.body(bytes).unwrap();
-
-        Ok(Response::from(response))
+        Ok(current_resp)
     }
 }

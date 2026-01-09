@@ -4,12 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "sync", "signal"] }
 futures = "0.3"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "socks", "cookies", "stream", "multipart"] }
+reqwest = { version = "0.12", features = ["json", "socks", "cookies", "stream", "multipart", "gzip", "brotli"] }
 reqwest-middleware = "0.4"
-reqwest-retry = "0.8"
 http = "1.0"
 url = "2.5"
 bytes = "1.6"
@@ -35,6 +34,12 @@ booktoki_captcha = { git = "https://github.com/FWW321/booktoki_captcha.git", bra
 blake3 = "1.8.2"
 parking_lot = "0.12"
 percent-encoding = "2.3.2"
+
+# New dependencies for refactoring
+indicatif = "0.18"
+strum = { version = "0.27", features = ["derive"] }
+strum_macros = "0.27"
+tokio-util = "0.7.17"
 
 [[bin]]
 name = "spider"
