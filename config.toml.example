@@ -20,10 +20,10 @@ headless = true               # 是否开启无头模式 (true: 不显示浏览�
 # chrome_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
 
 [spider]
-concurrency = 5               # 全局最大并发采集任务数
+concurrency = 32               # 全局最大并发采集任务数
 retry_count = 3               # 请求失败时的最大重试次数
 
 # 站点特定配置
 [sites.booktoki]
 base_url = "https://booktoki469.com" # 站点基础 URL
-concurrent_tasks = 10                 # 该站点的并发限制 (覆盖全局配置)
+concurrent_tasks = 32                 # 该站点的并发限制 (覆盖全局配置)
