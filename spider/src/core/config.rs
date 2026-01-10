@@ -1,8 +1,10 @@
 //! 配置管理系统 (Configuration Management)
 //!
 //! 负责 `config.toml` 的反序列化及其层级结构映射，支持环境变量与默认值回退机制。
+//! 如果配置文件不存在，会自动生成默认配置文件。
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
 use bon::Builder;
@@ -38,6 +40,9 @@ pub struct AppConfig {
 /// 代理网络配置
 #[derive(Debug, Deserialize, Builder, Clone)]
 pub struct ProxyConfig {
+    /// 是否启用代理（false 时使用直连模式）
+    #[serde(default = "default_proxy_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_proxy_port")]
     pub proxy_port: u16,
     #[serde(default)]
@@ -47,10 +52,15 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             proxy_port: 2080,
             subscription_urls: vec![],
         }
     }
+}
+
+fn default_proxy_enabled() -> bool {
+    true
 }
 
 fn default_proxy_port() -> u16 {
@@ -85,13 +95,16 @@ pub struct SiteConfig {
     pub base_url: Option<String>,
     /// 站点独占任务并行度
     pub concurrent_tasks: Option<usize>,
+    /// 是否强制使用代理（true 时禁用代理则拒绝执行）
+    #[serde(default)]
+    pub require_proxy: bool,
 }
 
 impl Default for SpiderConfig {
     fn default() -> Self {
         Self {
-            concurrency: 5,
-            retry_count: 3,
+            concurrency: default_concurrency(),
+            retry_count: default_retry_count(),
         }
     }
 }
@@ -120,17 +133,73 @@ fn default_retry_count() -> u32 {
 
 impl AppConfig {
     /// 从文件系统中加载并解析配置
+    ///
+    /// 如果配置文件不存在，会自动生成默认配置文件。
     pub fn load() -> Result<Self> {
         let config_path = Path::new("config.toml");
-        let builder = Config::builder();
 
-        let builder = if config_path.exists() {
-            builder.add_source(File::from(config_path))
-        } else {
-            builder
-        };
+        // 如果配置文件不存在，生成默认配置
+        if !config_path.exists() {
+            Self::create_default_config(config_path)?;
+        }
 
-        let settings = builder.build().map_err(SpiderError::Config)?;
+        // 加载配置文件
+        let settings = Config::builder()
+            .add_source(File::from(config_path))
+            .build()
+            .map_err(SpiderError::Config)?;
+
         settings.try_deserialize().map_err(SpiderError::Config)
+    }
+
+    /// 创建默认配置文件
+    fn create_default_config(path: &Path) -> Result<()> {
+        const DEFAULT_CONFIG: &str = r#"# 配置文件
+# 首次运行自动生成，可根据需要修改
+
+# 基础路径配置
+cache_path = "cache"
+
+[proxy]
+enabled = true                 # 是否启用代理（false = 直连模式）
+proxy_port = 2080              # 本地 HTTP 代理监听端口
+# 代理订阅地址列表（为空时自动使用直连模式）
+subscription_urls = [
+    # "https://example.com/subscribe?token=xxx",
+]
+
+[browser]
+headless = true               # 是否开启无头模式 (true: 不显示浏览器窗口)
+# chrome_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+
+[spider]
+concurrency = 32               # 全局最大并发采集任务数
+retry_count = 3                # 请求失败时的最大重试次数
+
+# 站点特定配置示例
+# [sites.booktoki]
+# base_url = "https://booktoki469.com"
+# concurrent_tasks = 32
+# require_proxy = false  # 是否强制使用代理 (默认: false)
+"#;
+
+        fs::write(path, DEFAULT_CONFIG)
+            .map_err(SpiderError::Io)?;
+
+        println!("Created default configuration file: {}", path.display());
+        println!("Edit config.toml to customize your settings.");
+        Ok(())
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            cache_path: default_cache_path(),
+            proxy: ProxyConfig::default(),
+            browser: BrowserConfig::default(),
+            spider: SpiderConfig::default(),
+            sites: HashMap::new(),
+        }
     }
 }

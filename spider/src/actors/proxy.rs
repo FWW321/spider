@@ -100,16 +100,48 @@ impl ProxyManager {
     }
 
     async fn run(mut self) {
+        if !self.config.proxy.enabled {
+            info!("Proxy disabled by configuration (proxy.enabled = false)");
+            info!("Operating in DIRECT CONNECTION mode - all traffic will bypass proxy");
+            // 启动直连模式的本地监听服务（仍然提供接口，但流量直连）
+            if let Err(e) = self.start_local_server().await {
+                error!("Failed to start local server in direct mode: {}", e);
+                return;
+            }
+            info!("Local proxy listening on 127.0.0.1:{} (DIRECT MODE)", self.config.proxy.proxy_port);
+
+            // 直连模式下仍然处理消息，但 rotate 不做任何事
+            while let Ok(msg) = self.rx.recv_async().await {
+                match msg {
+                    ProxyMsg::Rotate { reply } => {
+                        debug!("Rotate requested but ignored in direct mode");
+                        if let Some(tx) = reply {
+                            let _ = tx.send(());
+                        }
+                    }
+                    ProxyMsg::Pause => {}
+                    ProxyMsg::Resume => {}
+                }
+            }
+            return;
+        }
+
         info!("Initializing internal proxy core (shoes)...");
 
         // 1. 获取订阅并解析节点
         match self.fetch_and_parse_nodes().await {
             Ok(nodes) => {
-                info!("Loaded {} proxy nodes", nodes.len());
+                if nodes.is_empty() {
+                    warn!("No subscription URLs configured, operating in DIRECT CONNECTION mode");
+                    warn!("Add proxy.subscription_urls to config.toml to enable proxy rotation");
+                } else {
+                    info!("Loaded {} proxy nodes", nodes.len());
+                }
                 self.nodes = nodes;
             }
             Err(e) => {
-                error!("Failed to fetch subscription: {}", e);
+                warn!("Failed to fetch subscription: {}, operating in DIRECT CONNECTION mode", e);
+                warn!("Check your subscription URLs and network connectivity");
             }
         }
 

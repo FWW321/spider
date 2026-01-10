@@ -54,7 +54,16 @@ impl HttpService {
         config: &AppConfig,
         session: &Session,
     ) -> Result<ClientWithMiddleware> {
-        let proxy_url = format!("http://127.0.0.1:{}", config.proxy.proxy_port);
+        let use_proxy = config.proxy.enabled;
+        let mut client_builder = reqwest::Client::builder();
+
+        // 仅在启用代理时配置代理
+        if use_proxy {
+            let proxy_url = format!("http://127.0.0.1:{}", config.proxy.proxy_port);
+            client_builder = client_builder
+                .proxy(reqwest::Proxy::all(proxy_url).map_err(SpiderError::Network)?);
+        }
+
         let mut headers = HeaderMap::new();
 
         // 基础凭据注入
@@ -78,16 +87,15 @@ impl HttpService {
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
 
-        let client_builder = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(proxy_url).map_err(SpiderError::Network)?)
+        let client = client_builder
             .default_headers(headers)
             .pool_max_idle_per_host(32)
             .tcp_nodelay(true) // 禁用 Nagle 算法以降低交互式请求延迟
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30));
-
-        let client = client_builder.build().map_err(SpiderError::Network)?;
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(SpiderError::Network)?;
 
         Ok(ClientBuilder::new(client)
             .with(SessionMiddleware)

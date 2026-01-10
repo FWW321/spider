@@ -4,8 +4,9 @@
 cache_path = "cache"  # 缓存、日志和下载数据的存储目录
 
 [proxy]
-proxy_port = 2080             # 本地 HTTP 代理监听端口
-# 代理订阅地址列表
+enabled = true                 # 是否启用代理（false = 直连模式）
+proxy_port = 2080              # 本地 HTTP 代理监听端口
+# 代理订阅地址列表（为空时自动使用直连模式）
 subscription_urls = [
     "https://example.com/subscribe?token=xxx",
     "https://another.com/link"
@@ -24,3 +25,4 @@ retry_count = 3               # 请求失败时的最大重试次数
 [sites.booktoki]
 base_url = "https://booktoki469.com" # 站点基础 URL
 concurrent_tasks = 32                 # 该站点的并发限制 (覆盖全局配置)
+require_proxy = false                 # 是否强制使用代理 (默认: false)
