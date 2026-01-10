@@ -7,7 +7,6 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
-pub mod singbox;
 pub mod subscription;
 
 /// 执行 URI 规范化 (URI Normalization)

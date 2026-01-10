@@ -18,8 +18,9 @@ pub struct AppConfig {
     #[serde(default = "default_cache_path")]
     pub cache_path: String,
 
-    /// 代理枢纽 (sing-box) 相关配置
-    pub singbox: SingboxConfig,
+    /// 代理 (Proxy) 相关配置
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 
     /// 自动化浏览器 (Chromium) 相关配置
     #[serde(default)]
@@ -35,15 +36,25 @@ pub struct AppConfig {
 }
 
 /// 代理网络配置
-#[derive(Debug, Deserialize, Builder, Clone, Default)]
-pub struct SingboxConfig {
-    /// 二进制执行文件搜索路径
-    #[serde(default = "default_bin_path")]
-    pub bin_path: String,
+#[derive(Debug, Deserialize, Builder, Clone)]
+pub struct ProxyConfig {
+    #[serde(default = "default_proxy_port")]
     pub proxy_port: u16,
-    pub api_port: u16,
-    pub api_secret: String,
+    #[serde(default)]
     pub subscription_urls: Vec<String>,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            proxy_port: 2080,
+            subscription_urls: vec![],
+        }
+    }
+}
+
+fn default_proxy_port() -> u16 {
+    2080
 }
 
 /// 浏览器引擎配置
@@ -96,9 +107,6 @@ impl Default for BrowserConfig {
 
 fn default_cache_path() -> String {
     "cache".to_string()
-}
-fn default_bin_path() -> String {
-    "bin".to_string()
 }
 fn default_headless() -> bool {
     true

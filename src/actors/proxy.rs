@@ -1,216 +1,277 @@
-//! 代理调度 Actor (Proxy Scheduling Actor)
+//! 代理管理器 (Proxy Manager)
 //!
-//! 负责代理节点的状态监测、健康分、轮换策略及底层选择器同步。
+//! 负责代理服务的生命周期管理、节点轮换及流量转发规则的动态更新。
+//! 使用 shoes 库在进程内直接运行代理核心，无需外部二进制依赖。
 
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::{Result, Context as _};
 use flume::{Receiver, Sender};
-use serde_json;
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::core::config::AppConfig;
-use crate::utils::singbox::SingBoxController;
-use crate::utils::subscription::{self, ProxyNode};
+use shoes::address::{Address, NetLocation, NetLocationMask};
+use shoes::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule, ReloadableProxySelector};
+use shoes::config::{
+    BindLocation, ClientChain, ClientChainHop, ClientConfig, ConfigSelection, ServerConfig,
+    ServerProxyConfig, Transport, TcpConfig,
+};
+use shoes::option_util::{NoneOrSome, OneOrSome};
+use shoes::resolver::{NativeResolver, Resolver};
+use shoes::tcp::chain_builder::build_client_chain_group;
+use shoes::tcp::tcp_server::start_servers;
 
-/// Actor Messages
+use crate::core::config::AppConfig;
+use crate::utils::subscription::{ProxyNode, fetch_subscription_urls};
+
+/// 代理控制指令
+#[derive(Debug)]
 pub enum ProxyMsg {
-    /// 获取当前活跃节点
-    GetNode {
-        reply: Sender<Option<ProxyNode>>,
-    },
-    /// 汇报请求成功，用于性能建模 (目前仅占位)
-    ReportSuccess {
-        tag: String,
-        latency: u128,
-    },
-    /// 汇报请求失败，触发节点降级与轮换
-    ReportFailure {
-        tag: String,
-    },
-    /// 强制触发出口 IP 轮换
+    /// 切换到下一个可用节点
     Rotate {
-        reply: Option<tokio::sync::oneshot::Sender<()>>,
+        reply: Option<oneshot::Sender<()>>,
     },
+    /// 暂停/恢复代理服务 (预留)
+    Pause,
+    Resume,
 }
 
-/// Actor Implementation
+#[derive(Debug, Serialize, Deserialize)]
+struct ProxyState {
+    last_node_index: usize,
+}
+
 pub struct ProxyManager {
-    /// 消息接收端
+    config: Arc<AppConfig>,
     rx: Receiver<ProxyMsg>,
-    /// 底层进程控制器
-    controller: Arc<SingBoxController>,
-    /// 节点池 (基于权重/健康分排序)
-    nodes: Vec<ProxyNode>,
-    /// 配置与状态持久化路径
-    cache_path: PathBuf,
+    selector: Arc<ReloadableProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    nodes: Vec<ClientConfig>,
+    current_node_index: usize,
 }
 
 impl ProxyManager {
-    /// 启动代理调度 Actor 并初始化底层进程
+    /// 启动代理管理器 Actor
     pub async fn start(config: Arc<AppConfig>) -> (Sender<ProxyMsg>, JoinHandle<()>) {
         let (tx, rx) = flume::unbounded();
-
-        let bin_path = Path::new(&config.singbox.bin_path);
-        let cache_path = Path::new(&config.cache_path);
-
-        // 订阅同步与预处理 (Subscription Ingestion)
-        let mut nodes =
-            subscription::fetch_subscription_urls(&config.singbox.subscription_urls, cache_path)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("Subscription fetch error: {}", e);
-                    vec![]
-                });
-
-        debug!("Fetched {} proxy nodes", nodes.len());
-        info!("Proxy scheduler initialized");
-
-        // 加载持久化的节点优先级 (Priority Recovery)
-        let order_file = cache_path.join("proxy_order.json");
-        if order_file.exists() {
-            if let Ok(json) = tokio::fs::read_to_string(&order_file).await {
-                if let Ok(ordered_tags) = serde_json::from_str::<Vec<String>>(&json) {
-                    debug!("Recovering node priorities ({} entries)", ordered_tags.len());
-
-                    let mut reordered = Vec::with_capacity(nodes.len());
-                    let mut node_map: std::collections::HashMap<String, ProxyNode> =
-                        nodes.drain(..).map(|n| (n.tag().to_string(), n)).collect();
-
-                    for tag in ordered_tags {
-                        if let Some(node) = node_map.remove(&tag) {
-                            reordered.push(node);
-                        }
-                    }
-                    reordered.extend(node_map.into_values());
-                    nodes = reordered;
-                }
-            }
-        }
-
-        let config_content = subscription::generate_singbox_config(
-            &nodes,
-            config.singbox.proxy_port,
-            config.singbox.api_port,
-            &config.singbox.api_secret,
-            cache_path,
-        )
-        .unwrap_or_else(|e| {
-            error!("Config generation error: {}", e);
-            String::new()
-        });
-
-        let controller = Arc::new(
-            SingBoxController::new(
-                bin_path,
-                cache_path,
-                config.singbox.api_port,
-                &config.singbox.api_secret,
-            )
-            .expect("Failed to initialize process controller"),
-        );
-
-        // Hot Start
-        if !nodes.is_empty() {
-            if let Err(e) = controller.write_config(&config_content).await {
-                error!("Write config failed: {}", e);
-            }
-            if let Err(e) = controller.start().await {
-                error!("Start artifact failed: {}", e);
-            }
-            if let Err(e) = controller.wait_for_api(10).await {
-                error!("API readiness timeout: {}", e);
-            }
-        }
-
-        let mut actor = ProxyManager {
-            rx,
-            controller,
-            nodes,
-            cache_path: cache_path.to_path_buf(),
-        };
-
-        if !actor.nodes.is_empty() {
-            actor.rotate_and_save().await;
-        }
+        let config_clone = config.clone();
 
         let handle = tokio::spawn(async move {
-            actor.run().await;
+            let manager = Self::new(config_clone, rx);
+            manager.run().await;
         });
 
         (tx, handle)
     }
 
-    /// Actor 消息循环 (Event Loop)
-    async fn run(&mut self) {
+    fn new(config: Arc<AppConfig>, rx: Receiver<ProxyMsg>) -> Self {
+        let resolver = Arc::new(NativeResolver::new());
+        // 初始为空规则（默认阻断，直到节点加载完成）
+        let selector = Arc::new(ReloadableProxySelector::new(ClientProxySelector::new(vec![])));
+
+        Self {
+            config,
+            rx,
+            selector,
+            resolver,
+            nodes: Vec::new(),
+            current_node_index: 0,
+        }
+    }
+
+    async fn run(mut self) {
+        info!("Initializing internal proxy core (shoes)...");
+
+        // 1. 获取订阅并解析节点
+        match self.fetch_and_parse_nodes().await {
+            Ok(nodes) => {
+                info!("Loaded {} proxy nodes", nodes.len());
+                self.nodes = nodes;
+            }
+            Err(e) => {
+                error!("Failed to fetch subscription: {}", e);
+            }
+        }
+
+        // 恢复上次的状态并跳过最后一个节点
+        if !self.nodes.is_empty() {
+            if let Some(state) = self.load_state() {
+                // 如果有上次的状态，从下一个节点开始（跳过上次可能已封禁的节点）
+                self.current_node_index = (state.last_node_index + 1) % self.nodes.len();
+                info!(
+                    "Resuming from proxy node #{} (Last used: #{}, skipped)",
+                    self.current_node_index, state.last_node_index
+                );
+            } else {
+                self.current_node_index = 0;
+            }
+            // 立即保存新的起始状态，防止启动即崩溃导致状态未更新
+            self.save_state();
+        }
+
+        // 2. 启动本地监听服务
+        if let Err(e) = self.start_local_server().await {
+            error!("Failed to start local proxy server: {}", e);
+            return;
+        }
+
+        // 3. 应用初始节点
+        self.apply_node();
+
+        // 4. 事件循环
         while let Ok(msg) = self.rx.recv_async().await {
             match msg {
-                ProxyMsg::GetNode { reply } => {
-                    let _ = reply.send(self.nodes.first().cloned());
-                }
-                ProxyMsg::ReportFailure { tag } => {
-                    if self.nodes.is_empty() {
-                        continue;
-                    }
-
-                    // 节点惩罚逻辑 (Deprioritization)
-                    if let Some(current) = self.nodes.first() {
-                        if current.tag() == tag {
-                            warn!("Node [{}] failure detected, deprioritizing...", tag);
-                            self.rotate_and_save().await;
-                        } else {
-                            debug!("Ignored stale failure report: {} (active: {})", tag, current.tag());
-                        }
-                    }
-                }
                 ProxyMsg::Rotate { reply } => {
-                    warn!("Forced rotation triggered");
-                    self.rotate_and_save().await;
+                    self.rotate_node();
                     if let Some(tx) = reply {
                         let _ = tx.send(());
                     }
                 }
-                ProxyMsg::ReportSuccess { .. } => {}
+                ProxyMsg::Pause => {
+                    info!("Proxy service paused (not implemented)");
+                }
+                ProxyMsg::Resume => {
+                    info!("Proxy service resumed (not implemented)");
+                }
             }
         }
     }
 
-    /// 执行节点切换并持久化状态
-    async fn rotate_and_save(&mut self) {
-        if self.nodes.len() < 2 {
+    fn get_state_path(&self) -> PathBuf {
+        PathBuf::from(&self.config.cache_path).join("proxy_state.json")
+    }
+
+    fn load_state(&self) -> Option<ProxyState> {
+        let path = self.get_state_path();
+        if path.exists() {
+            if let Ok(file) = std::fs::File::open(&path) {
+                if let Ok(state) = serde_json::from_reader(file) {
+                    return Some(state);
+                }
+            }
+        }
+        None
+    }
+
+    fn save_state(&self) {
+        let path = self.get_state_path();
+        // 确保存储目录存在
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        
+        if let Ok(file) = std::fs::File::create(&path) {
+            let state = ProxyState {
+                last_node_index: self.current_node_index,
+            };
+            let _ = serde_json::to_writer(file, &state);
+        }
+    }
+
+    async fn fetch_and_parse_nodes(&self) -> Result<Vec<ClientConfig>> {
+        let urls = &self.config.proxy.subscription_urls;
+        if urls.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cache_path = PathBuf::from(&self.config.cache_path);
+        let proxy_nodes = fetch_subscription_urls(urls, &cache_path).await?;
+
+        let client_configs: Vec<ClientConfig> = proxy_nodes
+            .into_iter()
+            .filter_map(|node| match node.to_shoes_config() {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    debug!("Skipping invalid node {}: {}", node.tag(), e);
+                    None
+                }
+            })
+            .collect();
+
+        Ok(client_configs)
+    }
+
+    async fn start_local_server(&self) -> Result<()> {
+        let port = self.config.proxy.proxy_port;
+        // 绑定到 127.0.0.1
+        let bind_addr = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
+        let location = NetLocation::new(bind_addr, port);
+        
+        // 创建 Mixed (HTTP+SOCKS5) 服务端配置
+        let server_config = ServerConfig {
+            bind_location: BindLocation::Address(location.into()),
+            protocol: ServerProxyConfig::Mixed {
+                username: None,
+                password: None,
+                udp_enabled: true,
+            },
+            transport: Transport::Tcp,
+            tcp_settings: Some(TcpConfig { no_delay: true }),
+            quic_settings: None,
+            rules: NoneOrSome::None,
+        };
+
+        // 启动服务，后台运行
+        let _handles = start_servers(
+            shoes::config::Config::Server(server_config),
+            self.selector.clone(),
+            self.resolver.clone(),
+        ).await.map_err(|e| anyhow::anyhow!("Server start error: {}", e))?;
+
+        info!("Local proxy listening on 127.0.0.1:{}", port);
+        Ok(())
+    }
+
+    fn rotate_node(&mut self) {
+        if self.nodes.is_empty() {
+            warn!("No proxy nodes available to rotate");
             return;
         }
 
-        // 循环左移，将故障节点移至队尾 (Round-robin with Deprioritization)
-        self.nodes.rotate_left(1);
-
-        if let Some(new_head) = self.nodes.first() {
-            info!("Rotating to new exit node...");
-            debug!("Selected node: {}", new_head.tag());
-            if let Err(e) = self
-                .controller
-                .switch_selector("proxy_selector", new_head.tag())
-                .await
-            {
-                error!("Selector switch failed: {}", e);
-            }
-        }
-
-        self.save_order().await;
+        self.current_node_index = (self.current_node_index + 1) % self.nodes.len();
+        self.save_state(); // 保存新状态
+        self.apply_node();
     }
 
-    /// 持久化节点排序，确保跨进程生存期一致性
-    async fn save_order(&self) {
-        let tags: Vec<String> = self.nodes.iter().map(|n| n.tag().to_string()).collect();
-        let path = self.cache_path.join("proxy_order.json");
-
-        if let Ok(json) = serde_json::to_string_pretty(&tags) {
-            if let Err(e) = tokio::fs::write(&path, json).await {
-                warn!("Save proxy state error: {}", e);
-            } else {
-                debug!("Proxy state persisted");
-            }
+    fn apply_node(&mut self) {
+        if self.nodes.is_empty() {
+            return;
         }
+
+        let node = &self.nodes[self.current_node_index];
+        let protocol_name = node.protocol.protocol_name();
+        
+        info!(
+            "Rotating proxy to node #{} [Protocol: {}] - {}", 
+            self.current_node_index, 
+            protocol_name,
+            node.address
+        );
+
+        // 构建指向当前节点的链
+        let chain_hop = ClientChainHop::Single(ConfigSelection::Config(node.clone()));
+        let chain = ClientChain {
+            hops: OneOrSome::One(chain_hop),
+        };
+        
+        // 构建链组 (Chain Group)
+        let chain_group = build_client_chain_group(
+            NoneOrSome::Some(vec![chain]), 
+            self.resolver.clone()
+        );
+
+        // 构建路由规则：匹配所有流量 (0.0.0.0/0)，转发给该链组
+        let rule = ConnectRule::new(
+            vec![NetLocationMask::ANY], // 匹配所有
+            ConnectAction::new_allow(None, chain_group),
+        );
+
+        // 更新选择器
+        let new_selector = ClientProxySelector::new(vec![rule]);
+        self.selector.update(new_selector);
     }
 }

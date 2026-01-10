@@ -1,8 +1,9 @@
 //! 代理订阅管理工具 (Subscription Management)
 //!
-//! 提供多协议代理节点的解析、去重、持久化缓存及 sing-box 运行时配置生成。
+//! 提供多协议代理节点的解析、去重、持久化缓存及 shoes 运行时配置生成。
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,82 +13,432 @@ use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, warn};
 use url::Url;
 
+use shoes::address::{Address, NetLocation};
+
+use shoes::config::{
+
+    ClientConfig, ClientProxyConfig, ShadowsocksConfig, TlsClientConfig,
+
+    Transport, WebsocketClientConfig,
+
+};
+
+use shoes::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
+
+
+
 /// 代理出口节点封装 (Proxy Outbound Container)
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 pub struct ProxyNode {
+
     #[serde(flatten)]
+
     pub outbound: Outbound,
+
 }
+
+
 
 impl ProxyNode {
+
     /// 提取节点唯一标识标签
+
     pub fn tag(&self) -> &str {
+
         match &self.outbound {
-            Outbound::Shadowsocks { tag, .. }
-            | Outbound::Vmess { tag, .. }
-            | Outbound::Vless { tag, .. }
-            | Outbound::Trojan { tag, .. } => tag,
+
+            Outbound::Shadowsocks {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Vmess {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Vless {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Trojan {
+
+                tag,
+
+                ..
+
+            } => tag,
+
         }
+
     }
+
+
 
     pub fn set_tag(&mut self, new_tag: String) {
+
         match &mut self.outbound {
-            Outbound::Shadowsocks { tag, .. }
-            | Outbound::Vmess { tag, .. }
-            | Outbound::Vless { tag, .. }
-            | Outbound::Trojan { tag, .. } => *tag = new_tag,
+
+            Outbound::Shadowsocks {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Vmess {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Vless {
+
+                tag,
+
+                ..
+
+            }
+
+            | Outbound::Trojan {
+
+                tag,
+
+                ..
+
+            } => *tag = new_tag,
+
         }
+
     }
+
+
+
+    /// 转换为 Shoes 客户端配置
+
+    pub fn to_shoes_config(&self) -> Result<ClientConfig> {
+
+        self.outbound.to_shoes_config()
+
+    }
+
 }
 
+
+
 /// 支持的代理协议变体 (Protocol Variants)
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 #[serde(tag = "type", rename_all = "kebab-case")]
+
 pub enum Outbound {
+
     Shadowsocks {
+
         tag: String,
+
         server: String,
+
         server_port: u16,
+
         method: String,
+
         password: String,
+
     },
+
     Vmess {
+
         tag: String,
+
         server: String,
+
         server_port: u16,
+
         uuid: String,
+
         security: String,
+
         alter_id: u32,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         transport: Option<V2RayTransport>,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         tls: Option<TlsOutbound>,
+
     },
+
     Vless {
+
         tag: String,
+
         server: String,
+
         server_port: u16,
+
         uuid: String,
+
         flow: String,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         transport: Option<V2RayTransport>,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         tls: Option<TlsOutbound>,
+
     },
+
     Trojan {
+
         tag: String,
+
         server: String,
+
         server_port: u16,
+
         password: String,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         tls: Option<TlsOutbound>,
+
         #[serde(skip_serializing_if = "Option::is_none")]
+
         transport: Option<V2RayTransport>,
+
     },
+
+}
+
+
+
+impl Outbound {
+
+    fn to_shoes_config(&self) -> Result<ClientConfig> {
+
+        let (server, port) = match self {
+
+            Outbound::Shadowsocks {
+
+                server,
+
+                server_port,
+
+                ..
+
+            }
+
+            | Outbound::Vmess {
+
+                server,
+
+                server_port,
+
+                ..
+
+            }
+
+            | Outbound::Vless {
+
+                server,
+
+                server_port,
+
+                ..
+
+            }
+
+            | Outbound::Trojan {
+
+                server,
+
+                server_port,
+
+                ..
+
+            } => (server.clone(), *server_port),
+
+        };
+
+
+
+        // 构建目标地址 (Address)
+
+        let address = if let Ok(ip) = server.parse::<IpAddr>() {
+
+            let addr = match ip {
+
+                IpAddr::V4(a) => Address::Ipv4(a),
+
+                IpAddr::V6(a) => Address::Ipv6(a),
+
+            };
+
+            NetLocation::new(addr, port)
+
+        } else {
+
+            NetLocation::new(Address::Hostname(server.clone()), port)
+
+        };
+
+
+
+        // ... (rest of the function)
+
+        // 基础协议配置
+        let mut protocol = match self {
+            Outbound::Shadowsocks {
+                method, password, ..
+            } => ClientProxyConfig::Shadowsocks {
+                config: ShadowsocksConfig::from_fields(method, password)
+                    .map_err(|e| anyhow!("Invalid SS config: {}", e))?,
+                udp_enabled: true,
+            },
+            Outbound::Vmess {
+                uuid,
+                security,
+                ..
+            } => ClientProxyConfig::Vmess {
+                cipher: security.clone(),
+                user_id: uuid.clone(),
+                udp_enabled: true,
+            },
+            Outbound::Vless { uuid, .. } => ClientProxyConfig::Vless {
+                user_id: uuid.clone(),
+                udp_enabled: true,
+            },
+            Outbound::Trojan { password, .. } => ClientProxyConfig::Trojan {
+                password: password.clone(),
+                shadowsocks: None,
+            },
+        };
+
+        // 协议包装层级: TLS -> WebSocket -> Core Protocol
+        // 注意：Shoes 的分层是通过 ClientProxyConfig 的嵌套实现的。
+        // 例如：WebSocket { protocol: Box::new(Vmess) }
+        //      Tls { protocol: Box::new(WebSocket) }
+
+        let transport_config = match self {
+            Outbound::Vmess { transport, .. }
+            | Outbound::Vless { transport, .. }
+            | Outbound::Trojan { transport, .. } => transport.as_ref(),
+            _ => None,
+        };
+
+        let tls_config = match self {
+            Outbound::Vmess { tls, .. }
+            | Outbound::Vless { tls, .. }
+            | Outbound::Trojan { tls, .. } => tls.as_ref(),
+            _ => None,
+        };
+
+        // 1. WebSocket Layer
+        if let Some(V2RayTransport::Websocket { path, headers }) = transport_config {
+            protocol = ClientProxyConfig::Websocket(WebsocketClientConfig {
+                matching_path: path.clone(),
+                matching_headers: headers.clone(),
+                ping_type: Default::default(),
+                protocol: Box::new(protocol),
+            });
+        }
+
+        // 2. TLS Layer
+        if let Some(tls) = tls_config {
+            if tls.enabled {
+                let sni_hostname = match &tls.server_name {
+                    Some(s) => NoneOrOne::One(s.clone()),
+                    None => NoneOrOne::Unspecified,
+                };
+
+                let alpn_protocols = match &tls.alpn {
+                    Some(v) if !v.is_empty() => NoneOrSome::Some(v.clone()),
+                    _ => NoneOrSome::Unspecified,
+                };
+
+                // 如果是 VLESS + XTLS/Reality
+                if let Outbound::Vless { flow, .. } = self {
+                     if flow == "xtls-rprx-vision" {
+                         protocol = ClientProxyConfig::Tls(TlsClientConfig {
+                             verify: !tls.insecure.unwrap_or(false),
+                             server_fingerprints: NoneOrSome::Unspecified,
+                             sni_hostname,
+                             alpn_protocols,
+                             tls_buffer_size: None,
+                             key: None,
+                             cert: None,
+                             vision: true,
+                             protocol: Box::new(protocol),
+                         });
+                         return Ok(ClientConfig {
+                             bind_interface: NoneOrOne::None,
+                             address,
+                             protocol,
+                             transport: Transport::Tcp,
+                             tcp_settings: None,
+                             quic_settings: None,
+                         });
+                     }
+                }
+
+                // Standard TLS
+                let server_fingerprints = if let Some(utls) = &tls.utls {
+                    NoneOrSome::One(utls.fingerprint.clone())
+                } else {
+                    NoneOrSome::Unspecified
+                };
+
+                protocol = ClientProxyConfig::Tls(TlsClientConfig {
+                    verify: !tls.insecure.unwrap_or(false),
+                    server_fingerprints,
+                    sni_hostname,
+                    alpn_protocols,
+                    tls_buffer_size: None,
+                    key: None,
+                    cert: None,
+                    vision: false,
+                    protocol: Box::new(protocol),
+                });
+            }
+        }
+        
+        // 特殊处理：Trojan 默认通常包裹在 TLS 中，如果配置没有显式 TLS 但协议是 Trojan，
+        // 某些客户端可能隐含 TLS。但这里我们严格遵循解析出的结构。
+
+        Ok(ClientConfig {
+            bind_interface: NoneOrOne::None,
+            address,
+            protocol,
+            transport: Transport::Tcp,
+            tcp_settings: None,
+            quic_settings: None,
+        })
+    }
 }
 
 /// 传输层封装协议 (Transport Layer)
@@ -145,8 +496,6 @@ fn decode_base64_auto(input: &str) -> Result<String> {
 }
 
 /// 执行订阅内容解析 (Content Ingestion)
-/// 
-/// 自动识别并解析 Clash YAML 或原始 URI 列表（含 Base64 编码）。
 pub fn parse_subscription_content(content: &str) -> Result<Vec<ProxyNode>> {
     let content = content.trim();
 
@@ -542,13 +891,13 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
         .build()?;
     let client = Arc::new(client);
 
-    let fetches = stream::iter(urls)
+    let fetches = stream::iter(urls.to_vec())
         .map(|url| {
             let client = client.clone();
             async move {
                 debug!("Fetching subscription: {}", url);
                 client
-                    .get(url)
+                    .get(&url)
                     .send()
                     .await
                     .map_err(|e| {
@@ -601,66 +950,4 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
     }
 
     Ok(all_nodes)
-}
-
-/// 生成面向 sing-box 的运行时 JSON 配置文件
-pub fn generate_singbox_config(
-    nodes: &[ProxyNode],
-    proxy_port: u16,
-    api_port: u16,
-    api_secret: &str,
-    cache_path: &Path,
-) -> Result<String> {
-    if nodes.is_empty() {
-        return Err(anyhow!("Node set is empty, configuration aborted"));
-    }
-
-    let node_tags: Vec<String> = nodes.iter().map(|n| n.tag().to_string()).collect();
-
-    let mut outbound_list = vec![
-        json!({ "type": "direct", "tag": "direct" }),
-        json!({
-            "type": "selector",
-            "tag": "proxy_selector",
-            "outbounds": node_tags,
-            "default": node_tags.first().unwrap_or(&"direct".to_string()),
-            "interrupt_exist_connections": true
-        }),
-    ];
-
-    for node in nodes {
-        outbound_list.push(serde_json::to_value(&node.outbound)?);
-    }
-
-    let config = json!({
-        "log": { "level": "info" },
-        "dns": {
-            "servers": [{ "type": "https", "tag": "dns-local", "server": "223.5.5.5" }],
-            "final": "dns-local"
-        },
-        "inbounds": [{
-            "type": "mixed", "tag": "proxy-in", "listen": "127.0.0.1", "listen_port": proxy_port
-        }],
-        "outbounds": outbound_list,
-        "route": {
-            "rules": [
-                { "protocol": "dns", "outbound": "direct" },
-                { "outbound": "proxy_selector", "inbound": "proxy-in" }
-            ],
-            "final": "direct",
-            "auto_detect_interface": true
-        },
-        "experimental": {
-            "clash_api": {
-                "external_controller": format!("127.0.0.1:{}", api_port),
-                "secret": api_secret
-            },
-            "cache_file": {
-                "enabled": true,
-                "path": cache_path.join("cache.db").to_str()
-            }
-        }
-    });
-
-    serde_json::to_string_pretty(&config).context("Config serialization failed")
 }

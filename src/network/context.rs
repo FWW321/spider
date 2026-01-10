@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::Rng;
 use flume::Sender;
 use reqwest::Method;
 use reqwest_middleware::RequestBuilder;
@@ -149,7 +150,8 @@ impl ServiceContext {
             // 只有当真正发生过等待（即系统从 Blocked 恢复为 Running）时，才应用随机抖动。
             // 正常运行时的第一次请求不会触发此逻辑。
             if waited {
-                 tokio::time::sleep(Duration::from_millis(fastrand::u64(0..50))).await;
+                 let jitter = Duration::from_millis(rand::rng().random_range(0..50));
+                 tokio::time::sleep(jitter).await;
             }
 
             attempts += 1;
@@ -216,8 +218,13 @@ impl ServiceContext {
         
         // Equal Jitter implementation
         let half = ceil / 2;
-        // fastrand::u64(0..v) 生成 [0, v)
-        let jitter_nanos = fastrand::u64(0..half.as_nanos() as u64);
+        let limit = half.as_nanos() as u64;
+        
+        let jitter_nanos = if limit > 0 {
+            rand::rng().random_range(0..limit)
+        } else {
+            0
+        };
         
         half + Duration::from_nanos(jitter_nanos)
     }

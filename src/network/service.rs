@@ -54,7 +54,7 @@ impl HttpService {
         config: &AppConfig,
         session: &Session,
     ) -> Result<ClientWithMiddleware> {
-        let proxy_url = format!("http://127.0.0.1:{}", config.singbox.proxy_port);
+        let proxy_url = format!("http://127.0.0.1:{}", config.proxy.proxy_port);
         let mut headers = HeaderMap::new();
 
         // 基础凭据注入

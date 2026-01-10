@@ -181,7 +181,7 @@ fn build_browser_config(config: &AppConfig, ua: &str) -> Result<BrowserConfig> {
         .arg("--disable-extensions")
         .arg(format!(
             "--proxy-server=http://127.0.0.1:{}",
-            config.singbox.proxy_port
+            config.proxy.proxy_port
         ));
 
     if config.browser.headless {
