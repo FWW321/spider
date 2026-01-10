@@ -3,7 +3,7 @@
 use base64::engine::{Engine as _, general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 
-use crate::shadowsocks::ShadowsocksCipher;
+use crate::protocols::shadowsocks::ShadowsocksCipher;
 
 #[derive(Debug, Clone)]
 pub enum ShadowsocksConfig {

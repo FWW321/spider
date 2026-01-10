@@ -1,7 +1,7 @@
 //! Configuration group types (top-level Config, groups, and NamedPem).
 
 use serde::{Deserialize, Serialize};
-use crate::option_util::OneOrSome;
+use crate::utils::option::OneOrSome;
 use super::client::ClientConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;

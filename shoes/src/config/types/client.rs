@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::NetLocation;
-use crate::option_util::{NoneOrOne, NoneOrSome};
+use crate::utils::address::NetLocation;
+use crate::utils::option::{NoneOrOne, NoneOrSome};
 
 use super::common::{
     default_reality_client_short_id, default_true, is_false, is_true, unspecified_address,
@@ -193,7 +193,7 @@ pub enum ClientProxyConfig {
             default,
             skip_serializing_if = "NoneOrSome::is_unspecified"
         )]
-        cipher_suites: NoneOrSome<crate::reality::CipherSuite>,
+        cipher_suites: NoneOrSome<crate::protocols::reality::CipherSuite>,
 
         /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
         /// When enabled, the inner protocol MUST be VLESS.

@@ -1,10 +1,10 @@
 //! Configuration validation - validates configs and creates final ServerConfigs.
 
 use std::collections::HashMap;
-use crate::address::NetLocationMask;
-use crate::option_util::{NoneOrSome, OneOrSome};
-use crate::thread_util::get_num_threads;
-use crate::uuid_util::parse_uuid;
+use crate::utils::address::NetLocationMask;
+use crate::utils::option::{NoneOrSome, OneOrSome};
+use crate::utils::thread::get_num_threads;
+use crate::utils::uuid::parse_uuid;
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,

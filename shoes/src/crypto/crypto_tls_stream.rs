@@ -16,8 +16,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::crypto_connection::CryptoConnection;
-use crate::async_stream::{AsyncPing, AsyncStream};
-use crate::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
+use crate::network::async_stream::{AsyncPing, AsyncStream};
+use crate::utils::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
 
 /// TLS connection state machine (mirrors tokio-rustls TlsState)
 ///
@@ -435,4 +435,4 @@ where
 }
 
 // Implement AsyncStream blanket trait
-impl<IO> crate::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}
+impl<IO> crate::network::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}

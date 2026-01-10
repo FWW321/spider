@@ -24,12 +24,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::debug;
 
-use crate::address::NetLocation;
-use crate::async_stream::AsyncMessageStream;
-use crate::resolver::Resolver;
-use crate::tcp::proxy_connector::ProxyConnector;
-use crate::tcp::socket_connector::SocketConnector;
-use crate::tcp::tcp_handler::TcpClientSetupResult;
+use crate::utils::address::NetLocation;
+use crate::network::async_stream::AsyncMessageStream;
+use crate::utils::resolver::Resolver;
+use crate::network::tcp::proxy_connector::ProxyConnector;
+use crate::network::tcp::socket_connector::SocketConnector;
+use crate::network::tcp::tcp_handler::TcpClientSetupResult;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -548,9 +548,9 @@ mod tests {
     use async_trait::async_trait;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use crate::async_stream::AsyncStream;
-    use crate::tcp::proxy_connector::ProxyConnector;
-    use crate::tcp::socket_connector::SocketConnector;
+    use crate::network::async_stream::AsyncStream;
+    use crate::network::tcp::proxy_connector::ProxyConnector;
+    use crate::network::tcp::socket_connector::SocketConnector;
 
     /// Mock SocketConnector that fails on connect (for unit testing structure).
     #[derive(Debug)]

@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::{NetLocation, NetLocationMask, NetLocationPortRange};
-use crate::option_util::OneOrSome;
+use crate::utils::address::{NetLocation, NetLocationMask, NetLocationPortRange};
+use crate::utils::option::OneOrSome;
 
 /// Default Reality short_id: all zeros (16 hex chars = 8 bytes of zeros)
 pub const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
@@ -38,7 +38,7 @@ pub fn unspecified_address() -> NetLocation {
 }
 
 /// Implement Serialize for CipherSuite - serializes as the standard TLS cipher suite name
-impl Serialize for crate::reality::CipherSuite {
+impl Serialize for crate::protocols::reality::CipherSuite {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -48,15 +48,15 @@ impl Serialize for crate::reality::CipherSuite {
 }
 
 /// Implement Deserialize for CipherSuite - deserializes from standard TLS cipher suite name
-impl<'de> Deserialize<'de> for crate::reality::CipherSuite {
+impl<'de> Deserialize<'de> for crate::protocols::reality::CipherSuite {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
         let name = String::deserialize(deserializer)?;
-        crate::reality::CipherSuite::from_name(&name).ok_or_else(|| {
-            let valid_names: Vec<&str> = crate::reality::DEFAULT_CIPHER_SUITES
+        crate::protocols::reality::CipherSuite::from_name(&name).ok_or_else(|| {
+            let valid_names: Vec<&str> = crate::protocols::reality::DEFAULT_CIPHER_SUITES
                 .iter()
                 .map(|cs| cs.name())
                 .collect();

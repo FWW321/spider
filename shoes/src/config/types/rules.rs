@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::{NetLocation, NetLocationMask};
-use crate::option_util::{NoneOrSome, OneOrSome};
+use crate::utils::address::{NetLocation, NetLocationMask};
+use crate::utils::option::{NoneOrSome, OneOrSome};
 
 use super::client::ClientConfig;
 use super::selection::ConfigSelection;
@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for ClientChain {
                 )
             }
 
-            // String → single hop chain (group reference)
+            // String 鈫?single hop chain (group reference)
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where
                 E: Error,
@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for ClientChain {
                 })
             }
 
-            // Array → sequence of hops
+            // Array 鈫?sequence of hops
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
@@ -101,7 +101,7 @@ impl<'de> Deserialize<'de> for ClientChain {
                 })
             }
 
-            // Object → check for 'chain' key or treat as inline config
+            // Object 鈫?check for 'chain' key or treat as inline config
             fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
             where
                 A: serde::de::MapAccess<'de>,
@@ -458,10 +458,10 @@ pub enum RuleActionConfig {
         /// Each chain is a sequence of hops.
         /// Field name: `client_chains` (alias: `client_chain` for backward compatibility)
         ///
-        /// - `NoneOrSome::Unspecified` → Default to single chain with direct hop
-        /// - `NoneOrSome::None` → Error (validated later)
-        /// - `NoneOrSome::One(chain)` → Single chain
-        /// - `NoneOrSome::Some(chains)` → Multiple chains for round-robin
+        /// - `NoneOrSome::Unspecified` 鈫?Default to single chain with direct hop
+        /// - `NoneOrSome::None` 鈫?Error (validated later)
+        /// - `NoneOrSome::One(chain)` 鈫?Single chain
+        /// - `NoneOrSome::Some(chains)` 鈫?Multiple chains for round-robin
         client_chains: NoneOrSome<ClientChain>,
     },
     Block,

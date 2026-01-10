@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::address::{NetLocation, NetLocationPortRange};
-use crate::option_util::{NoneOrOne, NoneOrSome};
+use crate::utils::address::{NetLocation, NetLocationPortRange};
+use crate::utils::option::{NoneOrOne, NoneOrSome};
 
 use super::common::default_true;
 

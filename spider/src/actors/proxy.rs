@@ -14,16 +14,16 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use shoes::address::{Address, NetLocation, NetLocationMask};
-use shoes::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule, ReloadableProxySelector};
+use shoes::address::{Address, NetLocation};
+use shoes::client_proxy_selector::{ClientProxySelector, ReloadableProxySelector};
 use shoes::config::{
-    BindLocation, ClientChain, ClientChainHop, ClientConfig, ConfigSelection, ServerConfig,
+    BindLocation, ClientConfig, ServerConfig,
     ServerProxyConfig, Transport, TcpConfig,
 };
-use shoes::option_util::{NoneOrSome, OneOrSome};
+use shoes::option_util::NoneOrSome;
 use shoes::resolver::{NativeResolver, Resolver};
-use shoes::tcp::chain_builder::build_client_chain_group;
-use shoes::tcp::tcp_server::start_servers;
+use shoes::network::tcp::tcp_server::start_servers;
+use shoes::ProxySwapper;
 
 use crate::core::config::AppConfig;
 use crate::utils::subscription::{ProxyNode, fetch_subscription_urls};
@@ -50,6 +50,7 @@ pub struct ProxyManager {
     rx: Receiver<ProxyMsg>,
     selector: Arc<ReloadableProxySelector>,
     resolver: Arc<dyn Resolver>,
+    swapper: ProxySwapper,
     nodes: Vec<(String, ClientConfig)>,
     current_node_index: usize,
 }
@@ -70,14 +71,29 @@ impl ProxyManager {
 
     fn new(config: Arc<AppConfig>, rx: Receiver<ProxyMsg>) -> Self {
         let resolver = Arc::new(NativeResolver::new());
-        // 初始为空规则（默认阻断，直到节点加载完成）
-        let selector = Arc::new(ReloadableProxySelector::new(ClientProxySelector::new(vec![])));
+        // 初始为空选择器（使用直连，直到节点加载完成）
+        use shoes::config::{ClientChain, ClientChainHop, ClientConfig, ConfigSelection};
+        use shoes::utils::option::{NoneOrSome, OneOrSome};
+        use shoes::network::tcp::chain_builder::build_client_chain_group;
+
+        // 创建直连 chain group
+        let chain_hop = ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default()));
+        let chain = ClientChain {
+            hops: OneOrSome::One(chain_hop),
+        };
+        let chain_group = build_client_chain_group(NoneOrSome::Some(vec![chain]), resolver.clone());
+
+        let selector = Arc::new(ReloadableProxySelector::new(
+            ClientProxySelector::new_with_chain_group(chain_group)
+        ));
+        let swapper = ProxySwapper::new(selector.clone(), resolver.clone());
 
         Self {
             config,
             rx,
             selector,
             resolver,
+            swapper,
             nodes: Vec::new(),
             current_node_index: 0,
         }
@@ -271,26 +287,7 @@ impl ProxyManager {
             node.address
         );
 
-        // 构建指向当前节点的链
-        let chain_hop = ClientChainHop::Single(ConfigSelection::Config(node.clone()));
-        let chain = ClientChain {
-            hops: OneOrSome::One(chain_hop),
-        };
-        
-        // 构建链组 (Chain Group)
-        let chain_group = build_client_chain_group(
-            NoneOrSome::Some(vec![chain]), 
-            self.resolver.clone()
-        );
-
-        // 构建路由规则：匹配所有流量 (0.0.0.0/0)，转发给该链组
-        let rule = ConnectRule::new(
-            vec![NetLocationMask::ANY], // 匹配所有
-            ConnectAction::new_allow(None, chain_group),
-        );
-
-        // 更新选择器
-        let new_selector = ClientProxySelector::new(vec![rule]);
-        self.selector.update(new_selector);
+        // 使用 Swapper 一键切换
+        self.swapper.swap_to_node(node);
     }
 }

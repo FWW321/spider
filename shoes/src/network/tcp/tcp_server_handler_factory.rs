@@ -1,0 +1,409 @@
+//! Factory functions for creating TCP server handlers from config.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
+
+use crate::client_proxy_selector::ClientProxySelector;
+use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{
+    ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowsocksConfig, TlsServerConfig,
+    WebsocketServerConfig,
+};
+use crate::protocols::http::HttpTcpServerHandler;
+use crate::protocols::mixed::MixedTcpServerHandler;
+use crate::utils::option::OneOrSome;
+use crate::network::port_forward_handler::PortForwardServerHandler;
+use crate::protocols::reality::RealityServerTarget;
+use crate::utils::resolver::Resolver;
+use crate::utils::rustls_config::create_server_config;
+use crate::protocols::shadowsocks::ShadowsocksTcpHandler;
+use crate::protocols::socks::SocksTcpServerHandler;
+use crate::network::tcp::chain_builder::build_client_proxy_chain;
+use crate::network::tcp::tcp_handler::TcpServerHandler;
+use crate::network::tls_server::{
+    InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
+};
+use crate::protocols::trojan::TrojanTcpHandler;
+use crate::utils::uuid::parse_uuid;
+use crate::protocols::vless::vless_server_handler::VlessTcpServerHandler;
+use crate::protocols::vmess::VmessTcpServerHandler;
+use crate::network::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
+
+fn create_auth_credentials(
+    username: Option<String>,
+    password: Option<String>,
+) -> Option<(String, String)> {
+    match (&username, &password) {
+        (None, None) => None,
+        _ => Some((username.unwrap_or_default(), password.unwrap_or_default())),
+    }
+}
+
+/// Create a TCP server handler from config.
+///
+/// # Arguments
+/// * `server_proxy_config` - The protocol configuration
+/// * `client_proxy_selector` - Selector for outbound proxy routing
+/// * `resolver` - DNS resolver
+/// * `bind_ip` - Optional bind IP for handlers that need it (e.g., Socks5 UDP, Mixed)
+///
+/// The `bind_ip` is required for:
+/// - `Socks` with `udp_enabled: true` (for UDP ASSOCIATE)
+/// - `Mixed` with `udp_enabled: true` (for UDP ASSOCIATE)
+pub fn create_tcp_server_handler(
+    server_proxy_config: ServerProxyConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+) -> Box<dyn TcpServerHandler> {
+    match server_proxy_config {
+        ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
+            create_auth_credentials(username, password),
+            client_proxy_selector.clone(),
+        )),
+        ServerProxyConfig::Socks {
+            username,
+            password,
+            udp_enabled,
+        } => {
+            // Use 0.0.0.0 as default if bind_ip not provided
+            let ip = bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            Box::new(SocksTcpServerHandler::new(
+                create_auth_credentials(username, password),
+                udp_enabled,
+                ip,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+            ))
+        }
+        ServerProxyConfig::Mixed {
+            username,
+            password,
+            udp_enabled,
+        } => {
+            // Use 0.0.0.0 as default if bind_ip not provided
+            let ip = bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            Box::new(MixedTcpServerHandler::new(
+                create_auth_credentials(username, password),
+                udp_enabled,
+                ip,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+            ))
+        }
+        ServerProxyConfig::Shadowsocks {
+            config,
+            udp_enabled,
+        } => match config {
+            ShadowsocksConfig::Legacy { cipher, password } => {
+                Box::new(ShadowsocksTcpHandler::new_server(
+                    cipher,
+                    &password,
+                    udp_enabled,
+                    client_proxy_selector.clone(),
+                ))
+            }
+            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => {
+                Box::new(ShadowsocksTcpHandler::new_aead2022_server(
+                    cipher,
+                    &key_bytes,
+                    udp_enabled,
+                    client_proxy_selector.clone(),
+                ))
+            }
+        },
+        ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+            fallback,
+        } => Box::new(VlessTcpServerHandler::new(
+            &user_id,
+            udp_enabled,
+            client_proxy_selector.clone(),
+            resolver.clone(),
+            fallback,
+        )),
+        ServerProxyConfig::Trojan {
+            password,
+            shadowsocks,
+        } => Box::new(TrojanTcpHandler::new_server(
+            &password,
+            &shadowsocks,
+            client_proxy_selector.clone(),
+        )),
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            reality_targets,
+            tls_buffer_size,
+        } => {
+            let mut all_targets = tls_targets
+                .into_iter()
+                .map(|(sni, config)| {
+                    (
+                        sni,
+                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
+                    )
+                })
+                .collect::<FxHashMap<String, TlsServerTarget>>();
+            let default_tls_target = default_tls_target.map(|config| {
+                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
+            });
+            let reality_server_targets = reality_targets
+                .into_iter()
+                .map(|(sni, config)| {
+                    (
+                        sni,
+                        create_reality_server_target(
+                            config,
+                            client_proxy_selector,
+                            resolver,
+                            bind_ip,
+                        ),
+                    )
+                })
+                .collect::<FxHashMap<String, TlsServerTarget>>();
+            all_targets.extend(reality_server_targets);
+            Box::new(TlsServerHandler::new(
+                all_targets,
+                default_tls_target,
+                tls_buffer_size,
+                resolver.clone(),
+            ))
+        }
+        ServerProxyConfig::Vmess {
+            cipher,
+            user_id,
+            udp_enabled,
+        } => Box::new(VmessTcpServerHandler::new(
+            &cipher,
+            &user_id,
+            udp_enabled,
+            client_proxy_selector.clone(),
+        )),
+        ServerProxyConfig::Websocket { targets } => {
+            let server_targets: Vec<WebsocketServerTarget> = targets
+                .into_vec()
+                .into_iter()
+                .map(|config| {
+                    create_websocket_server_target(config, client_proxy_selector, resolver, bind_ip)
+                })
+                .collect::<Vec<_>>();
+            Box::new(WebsocketTcpServerHandler::new(server_targets))
+        }
+        ServerProxyConfig::PortForward { targets } => {
+            let targets = targets.into_vec();
+            Box::new(PortForwardServerHandler::new(
+                targets,
+                client_proxy_selector.clone(),
+            ))
+        }
+    }
+}
+
+fn create_tls_server_target(
+    tls_server_config: TlsServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+) -> TlsServerTarget {
+    let TlsServerConfig {
+        cert,
+        key,
+        alpn_protocols,
+        client_ca_certs,
+        client_fingerprints,
+        vision,
+        protocol,
+        override_rules: _,
+    } = tls_server_config;
+
+    // Certificates are already embedded as PEM data during config validation
+    let cert_bytes = cert.as_bytes().to_vec();
+    let key_bytes = key.as_bytes().to_vec();
+
+    let client_ca_certs = client_ca_certs
+        .into_iter()
+        .map(|cert| cert.as_bytes().to_vec())
+        .collect();
+
+    let effective_alpn = alpn_protocols.into_vec();
+
+    let server_config = Arc::new(create_server_config(
+        &cert_bytes,
+        &key_bytes,
+        client_ca_certs,
+        &effective_alpn,
+        &client_fingerprints.into_vec(),
+    ));
+
+    // Use parent selector (override_rules functionality removed for simplicity)
+    let effective_selector = client_proxy_selector.clone();
+
+    // Create inner_protocol based on protocol type
+    let inner_protocol = if vision {
+        // Vision requires VLESS protocol (validated in config/mod.rs)
+        if let ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+            fallback,
+        } = &protocol
+        {
+            let user_id_bytes = parse_uuid(user_id)
+                .expect("Invalid user_id UUID")
+                .into_boxed_slice();
+            InnerProtocol::VisionVless(VisionVlessConfig {
+                user_id: user_id_bytes,
+                udp_enabled: *udp_enabled,
+                fallback: fallback.clone(),
+            })
+        } else {
+            unreachable!("Vision requires VLESS (should be validated during config load)")
+        }
+    } else {
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        InnerProtocol::Normal(handler)
+    };
+
+    TlsServerTarget::Tls {
+        server_config,
+        effective_selector,
+        inner_protocol,
+    }
+}
+
+fn create_reality_server_target(
+    reality_server_config: RealityServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+) -> TlsServerTarget {
+    let RealityServerConfig {
+        private_key,
+        short_ids,
+        dest,
+        max_time_diff,
+        min_client_version,
+        max_client_version,
+        cipher_suites,
+        vision,
+        protocol,
+        dest_client_chain,
+        override_rules: _,
+    } = reality_server_config;
+
+    // Decode private key from base64url (validated during config load)
+    let private_key_bytes = crate::protocols::reality::decode_private_key(&private_key)
+        .expect("Invalid REALITY private key (should be validated during config load)");
+
+    // Decode short IDs from hex strings (validated during config load)
+    // OneOrSome ensures at least one short_id is always present (default is all zeros)
+    let short_id_bytes: Vec<[u8; 8]> = short_ids
+        .into_vec()
+        .into_iter()
+        .map(|s| {
+            crate::protocols::reality::decode_short_id(&s)
+                .expect("Invalid REALITY short_id (should be validated during config load)")
+        })
+        .collect();
+
+    // Use parent selector (override_rules functionality removed for simplicity)
+    let effective_selector = client_proxy_selector.clone();
+
+    // Create inner_protocol based on protocol type
+    let inner_protocol = if vision {
+        // Vision requires VLESS protocol (validated in config/mod.rs)
+        if let ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+            fallback,
+        } = &protocol
+        {
+            let user_id_bytes = parse_uuid(user_id)
+                .expect("Invalid user_id UUID")
+                .into_boxed_slice();
+            InnerProtocol::VisionVless(VisionVlessConfig {
+                user_id: user_id_bytes,
+                udp_enabled: *udp_enabled,
+                fallback: fallback.clone(),
+            })
+        } else {
+            unreachable!("Vision requires VLESS (should be validated during config load)")
+        }
+    } else {
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        InnerProtocol::Normal(handler)
+    };
+
+    // Build dest client chain: if specified use it, otherwise default to direct
+    let dest_client_chain = {
+        let hops = dest_client_chain.into_vec();
+        if hops.is_empty() {
+            // Default to direct connection
+            build_client_proxy_chain(
+                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                    ClientConfig::default(),
+                ))),
+                resolver.clone(),
+            )
+        } else if hops.len() == 1 {
+            build_client_proxy_chain(
+                OneOrSome::One(hops.into_iter().next().unwrap()),
+                resolver.clone(),
+            )
+        } else {
+            build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
+        }
+    };
+
+    TlsServerTarget::Reality(RealityServerTarget {
+        private_key: private_key_bytes,
+        short_ids: short_id_bytes,
+        dest,
+        max_time_diff,
+        min_client_version,
+        max_client_version,
+        cipher_suites: cipher_suites.into_vec(),
+        effective_selector,
+        inner_protocol,
+        dest_client_chain,
+    })
+}
+
+fn create_websocket_server_target(
+    websocket_server_config: WebsocketServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+) -> WebsocketServerTarget {
+    let WebsocketServerConfig {
+        matching_path,
+        matching_headers,
+        ping_type,
+        protocol,
+        override_rules: _,
+    } = websocket_server_config;
+
+    let matching_headers = matching_headers.map(|h| {
+        h.into_iter()
+            .map(|(mut key, val)| {
+                key.make_ascii_lowercase();
+                (key, val)
+            })
+            .collect::<FxHashMap<_, _>>()
+    });
+
+    // Use parent selector (override_rules functionality removed for simplicity)
+    let effective_selector = client_proxy_selector.clone();
+
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+
+    WebsocketServerTarget {
+        matching_path,
+        matching_headers,
+        ping_type,
+        handler,
+    }
+}

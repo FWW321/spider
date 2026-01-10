@@ -5,7 +5,7 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-use crate::reality::{RealityReader, RealityWriter};
+use crate::protocols::reality::{RealityReader, RealityWriter};
 
 /// Unified reader that works with both Rustls and REALITY connections
 pub enum CryptoReader<'a> {

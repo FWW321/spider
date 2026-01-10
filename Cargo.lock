@@ -6462,6 +6462,7 @@ dependencies = [
  "memchr",
  "parking_lot",
  "percent-encoding",
+ "pin-project-lite",
  "rand 0.9.2",
  "rcgen",
  "rustc-hash 2.1.1",

@@ -5,12 +5,12 @@
 
 use std::io::{self, Read, Write};
 
-use crate::reality::{
+use crate::protocols::reality::{
     RealityClientConnection, RealityServerConnection, feed_reality_client_connection,
     feed_reality_server_connection,
 };
 
-use crate::rustls_connection_util::{feed_rustls_client_connection, feed_rustls_server_connection};
+use crate::utils::rustls_connection::{feed_rustls_client_connection, feed_rustls_server_connection};
 
 use super::crypto_reader_writer::{CryptoReader, CryptoWriter};
 
@@ -284,8 +284,8 @@ mod tests {
 
     #[test]
     fn test_connection_type_queries() {
-        use crate::address::{Address, NetLocation};
-        use crate::reality::{
+        use crate::utils::address::{Address, NetLocation};
+        use crate::protocols::reality::{
             RealityClientConfig, RealityClientConnection, RealityServerConfig,
             RealityServerConnection,
         };

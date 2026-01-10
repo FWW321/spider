@@ -9,9 +9,9 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::async_stream::AsyncStream;
+use crate::network::async_stream::AsyncStream;
 use crate::crypto::{CryptoConnection, feed_crypto_connection};
-use crate::util::{allocate_vec, write_all};
+use crate::utils::common::{allocate_vec, write_all};
 
 /// Perform a complete TLS handshake using the provided rustls connection and stream.
 ///

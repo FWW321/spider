@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::option_util::NoneOrSome;
+use crate::utils::option::NoneOrSome;
 
 #[derive(Debug, Clone)]
 pub enum ConfigSelection<T> {
