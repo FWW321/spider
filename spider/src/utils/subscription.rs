@@ -141,6 +141,24 @@ impl ProxyNode {
 
     }
 
+    /// 计算节点指纹 (用于状态锚定)
+    pub fn fingerprint(&self) -> String {
+        // 使用 blake3 对序列化的配置进行哈希，确保唯一性
+        // Tag 包含在 outbound 中，因此 Tag 的改变会导致指纹改变，这是预期的行为
+        let json = serde_json::to_string(&self.outbound).unwrap_or_default();
+        blake3::hash(json.as_bytes()).to_hex().to_string()
+    }
+
+    /// 获取排序键 (Tag, Server, Port)
+    pub fn sort_key(&self) -> (String, String, u16) {
+        let (server, port) = match &self.outbound {
+            Outbound::Shadowsocks { server, server_port, .. }
+            | Outbound::Vmess { server, server_port, .. }
+            | Outbound::Vless { server, server_port, .. }
+            | Outbound::Trojan { server, server_port, .. } => (server.clone(), *server_port),
+        };
+        (self.tag().to_string(), server, port)
+    }
 }
 
 
@@ -924,6 +942,9 @@ pub async fn fetch_subscription_urls(urls: &[String], cache_path: &Path) -> Resu
             all_nodes.extend(nodes);
         }
     }
+
+    // 确保确定性顺序，防止因网络请求顺序不同导致指纹或 Tag 变动
+    all_nodes.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 
     // 标签去重与自动后缀追加
     let mut counts: HashMap<String, usize> = HashMap::new();

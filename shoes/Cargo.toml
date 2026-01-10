@@ -1,0 +1,46 @@
+[package]
+name = "shoes"
+version = "0.2.5"
+edition = "2024"
+license = "MIT"
+description = "A multi-protocol proxy library for spider."
+
+[lib]
+name = "shoes"
+crate-type = ["rlib"]
+
+[dependencies]
+async-trait = "0.1"
+aws-lc-rs = { version = "1.15", default-features = false }
+base64 = "0.22"
+blake3 = "1.8"
+bytes = "1.11"
+h2 = "0.4"
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+dashmap = "6.1"
+digest = "0.10"
+futures = "0.3"
+http = "1.4"
+indexmap = "2.13"
+log = { version = "0.4", features = ["release_max_level_info"] }
+lru = "0.16"
+md-5 = "0.10"
+memchr = "2.5"
+parking_lot = "0.12"
+percent-encoding = "2.3"
+rand = "0.9"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = "0.23"
+serde = { version = "1", features = ["derive", "std"] }
+serde_yml = "0.0.12"
+sha3 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["time", "codec"] }
+webpki-roots = { version = "1" }
+x509-parser = { version = "0.18", default-features = false, features = ["verify-aws"] }
+tracing = "0.1"
+rustc-hash = "2.1"
+subtle = "2.6"

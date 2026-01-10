@@ -42,7 +42,7 @@ pub enum ProxyMsg {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProxyState {
-    last_node_index: usize,
+    last_node_fingerprint: String,
 }
 
 pub struct ProxyManager {
@@ -50,7 +50,7 @@ pub struct ProxyManager {
     rx: Receiver<ProxyMsg>,
     selector: Arc<ReloadableProxySelector>,
     resolver: Arc<dyn Resolver>,
-    nodes: Vec<ClientConfig>,
+    nodes: Vec<(String, ClientConfig)>,
     current_node_index: usize,
 }
 
@@ -100,12 +100,25 @@ impl ProxyManager {
         // 恢复上次的状态并跳过最后一个节点
         if !self.nodes.is_empty() {
             if let Some(state) = self.load_state() {
-                // 如果有上次的状态，从下一个节点开始（跳过上次可能已封禁的节点）
-                self.current_node_index = (state.last_node_index + 1) % self.nodes.len();
-                info!(
-                    "Resuming from proxy node #{} (Last used: #{}, skipped)",
-                    self.current_node_index, state.last_node_index
-                );
+                // 查找上次使用的节点指纹对应的索引
+                let last_index = self.nodes.iter().position(|(fp, _)| *fp == state.last_node_fingerprint);
+                
+                if let Some(i) = last_index {
+                    // 如果找到了上次的节点，从下一个开始（跳过）
+                    self.current_node_index = (i + 1) % self.nodes.len();
+                    info!(
+                        "Resuming from proxy node #{} (Last used fingerprint: {}, skipped)",
+                        self.current_node_index, 
+                        &state.last_node_fingerprint.chars().take(8).collect::<String>()
+                    );
+                } else {
+                    // 如果找不到（节点列表变动），重置为0
+                    self.current_node_index = 0;
+                    info!(
+                        "Last used node not found (Fingerprint: {}), resetting to node #0", 
+                        &state.last_node_fingerprint.chars().take(8).collect::<String>()
+                    );
+                }
             } else {
                 self.current_node_index = 0;
             }
@@ -158,6 +171,10 @@ impl ProxyManager {
     }
 
     fn save_state(&self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+
         let path = self.get_state_path();
         // 确保存储目录存在
         if let Some(parent) = path.parent() {
@@ -165,14 +182,16 @@ impl ProxyManager {
         }
         
         if let Ok(file) = std::fs::File::create(&path) {
+            // 保存当前节点的指纹
+            let fingerprint = &self.nodes[self.current_node_index].0;
             let state = ProxyState {
-                last_node_index: self.current_node_index,
+                last_node_fingerprint: fingerprint.clone(),
             };
             let _ = serde_json::to_writer(file, &state);
         }
     }
 
-    async fn fetch_and_parse_nodes(&self) -> Result<Vec<ClientConfig>> {
+    async fn fetch_and_parse_nodes(&self) -> Result<Vec<(String, ClientConfig)>> {
         let urls = &self.config.proxy.subscription_urls;
         if urls.is_empty() {
             return Ok(vec![]);
@@ -181,10 +200,10 @@ impl ProxyManager {
         let cache_path = PathBuf::from(&self.config.cache_path);
         let proxy_nodes = fetch_subscription_urls(urls, &cache_path).await?;
 
-        let client_configs: Vec<ClientConfig> = proxy_nodes
+        let client_configs: Vec<(String, ClientConfig)> = proxy_nodes
             .into_iter()
             .filter_map(|node| match node.to_shoes_config() {
-                Ok(cfg) => Some(cfg),
+                Ok(cfg) => Some((node.fingerprint(), cfg)),
                 Err(e) => {
                     debug!("Skipping invalid node {}: {}", node.tag(), e);
                     None
@@ -242,7 +261,7 @@ impl ProxyManager {
             return;
         }
 
-        let node = &self.nodes[self.current_node_index];
+        let (_, node) = &self.nodes[self.current_node_index];
         let protocol_name = node.protocol.protocol_name();
         
         info!(
